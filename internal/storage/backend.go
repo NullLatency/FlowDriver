@@ -26,4 +26,7 @@ type Backend interface {
 
 	// CreateFolder creates a storage container (e.g. Google Drive folder) and returns its ID.
 	CreateFolder(ctx context.Context, name string) (string, error)
+
+	// FindFolder searches for an existing storage container by name and returns its ID.
+	FindFolder(ctx context.Context, name string) (string, error)
 }

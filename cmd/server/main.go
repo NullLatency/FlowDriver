@@ -45,18 +45,29 @@ func main() {
 		log.Fatalf("Backend login failed: %v", err)
 	}
 
-	// AUTOMATION: If folder ID is missing, create it and save back to config
+	// AUTOMATION: If folder ID is missing, find or create it
 	if appCfg.StorageType == "google" && appCfg.GoogleFolderID == "" {
-		log.Println("Zero-Config: Creating new Google Drive folder 'Flow-Data'...")
-		folderID, err := backend.CreateFolder(ctx, "Flow-Data")
+		log.Println("Zero-Config: Searching for existing Google Drive folder 'Flow-Data'...")
+		folderID, err := backend.FindFolder(ctx, "Flow-Data")
 		if err != nil {
-			log.Fatalf("Failed to auto-create folder: %v", err)
+			log.Fatalf("Failed to search for folder: %v", err)
 		}
+
+		if folderID == "" {
+			log.Println("Zero-Config: 'Flow-Data' not found. Creating new folder...")
+			folderID, err = backend.CreateFolder(ctx, "Flow-Data")
+			if err != nil {
+				log.Fatalf("Failed to auto-create folder: %v", err)
+			}
+		} else {
+			log.Printf("Zero-Config: Found existing folder with ID %s", folderID)
+		}
+
 		appCfg.GoogleFolderID = folderID
 		if err := appCfg.Save(configPath); err != nil {
 			log.Printf("Warning: Failed to save folder ID to %s: %v", configPath, err)
 		} else {
-			log.Printf("Zero-Config: Saved folder ID %s to %s", folderID, configPath)
+			log.Printf("Zero-Config: Config updated with folder ID %s", folderID)
 		}
 	}
 

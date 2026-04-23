@@ -101,3 +101,18 @@ func (b *LocalBackend) CreateFolder(ctx context.Context, name string) (string, e
 	}
 	return name, nil
 }
+
+func (b *LocalBackend) FindFolder(ctx context.Context, name string) (string, error) {
+	path := filepath.Join(b.baseDir, name)
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil // Not found
+		}
+		return "", err
+	}
+	if info.IsDir() {
+		return name, nil
+	}
+	return "", nil
+}

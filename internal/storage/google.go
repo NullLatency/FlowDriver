@@ -435,3 +435,50 @@ func (b *GoogleBackend) CreateFolder(ctx context.Context, name string) (string, 
 	b.folderID = resData.ID
 	return resData.ID, nil
 }
+
+func (b *GoogleBackend) FindFolder(ctx context.Context, name string) (string, error) {
+	tok, err := b.getValidToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	q := fmt.Sprintf("name = '%s' and mimeType = 'application/vnd.google-apps.folder' and trashed = false", name)
+	u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
+	v := u.Query()
+	v.Set("q", q)
+	v.Set("fields", "files(id, name)")
+	u.RawQuery = v.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("find folder returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var resData struct {
+		Files []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		return "", err
+	}
+
+	if len(resData.Files) > 0 {
+		b.folderID = resData.Files[0].ID
+		return resData.Files[0].ID, nil
+	}
+	return "", nil
+}

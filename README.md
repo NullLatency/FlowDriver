@@ -2,6 +2,8 @@
 
 **Flow Driver** is a covert transport system designed to tunnel network traffic (SOCKS5) through common cloud storage platforms like Google Drive. It allows for reliable communication in restrictive environments by leveraging legitimate API traffic.
 
+**Flow Driver** یک سیستم انتقال پنهان (Covert Transport) است که برای تونل کردن ترافیک شبکه (SOCKS5) از طریق پلتفرم‌های ذخیره‌سازی ابری رایج مانند گوگل درایو طراحی شده است. این ابزار با بهره‌گیری از ترافیک قانونی API، امکان ارتباط مطمئن در محیط‌های محدود شده را فراهم می‌کند.
+
 ---
 
 ## ⚠️ Disclaimer / سلب مسئولیت
@@ -18,13 +20,11 @@
 Flow Driver works by treating a cloud storage folder as a data queue:
 1.  **Client**: Captures local SOCKS5 requests and bundles them into a compact **Binary Protocol**. These binary "packets" are uploaded to a specific Google Drive folder.
 2.  **Server**: Continuously polls the Drive folder. When it finds a request from a client, it downloads it, opens a real TCP connection to the destination, and sends back the result as a response file.
-3.  **Isolation**: Multiple clients can share the same folder using unique `client_id`s, ensuring that each client only reads its own responses.
 
 ### فارسی
 نحوه عملکرد این ابزار به این صورت است که از یک پوشه در فضای ابری به عنوان صف داده‌ها استفاده می‌کند:
 1.  **کلاینت**: درخواست‌های SOCKS5 محلی را دریافت کرده و آن‌ها را در قالب یک **پروتکل باینری** فشرده بسته‌بندی می‌کند. این بسته‌ها در یک پوشه خاص در گوگل درایو آپلود می‌شوند.
 2.  **سرور**: به طور مداوم پوشه درایو را بررسی می‌کند. با یافتن درخواست جدید، آن را دانلود کرده، اتصال TCP واقعی را برقرار می‌کند و نتیجه را در قالب فایل‌های پاسخ به درایو بازمی‌گرداند.
-3.  **جداسازی**: چندین کلاینت می‌توانند از یک پوشه مشترک استفاده کنند؛ هر کلاینت دارای یک شناسه منحصر‌به‌فرد (`client_id`) است که تضمین می‌کند فقط پاسخ‌های مربوط به خود را دریافت کند.
 
 ---
 

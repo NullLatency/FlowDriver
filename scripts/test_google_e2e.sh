@@ -38,9 +38,9 @@ if [ ! -f "$TOKEN_FILE" ]; then
     exit 0
 fi
 
-# echo "Starting Server (Google Mode)..."
-# ./bin/server -c config.json -gc "$GC_FILE" &
-# SERVER_PID=$!
+echo "Starting Server (Google Mode)..."
+./bin/server -c config.json -gc "$GC_FILE" &
+SERVER_PID=$!
 
 echo "Starting Client (Google Mode)..."
 ./bin/client -c config.json -gc "$GC_FILE" &
