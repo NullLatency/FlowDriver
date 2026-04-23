@@ -1,0 +1,10 @@
+*.json
+bin/
+*.tmp
+*~
+.DS_Store
+*.zip
+*.exe
+*.json
+*.log
+*.token
