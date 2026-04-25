@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/NullLatency/flow-driver/internal/config"
 	"github.com/NullLatency/flow-driver/internal/httpclient"
@@ -72,14 +73,21 @@ func main() {
 	}
 
 	engine := transport.NewEngine(backend, false, "")
+
 	if appCfg.RefreshRateMs > 0 {
 		engine.SetPollRate(appCfg.RefreshRateMs)
 	}
 	if appCfg.FlushRateMs > 0 {
 		engine.SetFlushRate(appCfg.FlushRateMs)
 	}
+	if appCfg.IdleTimeoutSec > 0 {
+		engine.SetIdleTimeout(time.Duration(appCfg.IdleTimeoutSec) * time.Second)
+	}
+	if appCfg.StaleFileTTLSec > 0 {
+		engine.SetStaleFileTTL(time.Duration(appCfg.StaleFileTTLSec) * time.Second)
+	}
 
-	// Called by polling loop when a new incoming session file is found
+	// Called by polling loop when a new incoming session file is found.
 	engine.OnNewSession = func(sessionID, targetAddr string, session *transport.Session) {
 		log.Printf("Server received new session %s destined for %s", sessionID, targetAddr)
 		go handleServerConn(sessionID, targetAddr, session, engine)
