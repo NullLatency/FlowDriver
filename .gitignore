@@ -8,3 +8,5 @@ bin/
 *.json
 *.log
 *.token
+diagnostics/
+diagnostics-smoke/

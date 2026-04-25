@@ -30,129 +30,310 @@ Flow Driver works by treating a cloud storage folder as a data queue:
 
 ## Setup & Installation / نصب و راه‌اندازی
 
+This section is a complete client-to-server setup guide for the Google Drive backend.
+
 ### Prerequisites / پیش‌نیازها
-- **Go** (1.25 or higher)
-- **Google Drive API Credentials**: You need a `credentials.json` (OAuth2) file.
-- **Shared Folder (Auto)**: If you leave `google_folder_id` empty, the tool will automatically create a folder named **"Flow-Data"** and save its ID to your config!
 
-### 1. Obtain Credentials / دریافت فایل اعتبارنامه
-To get your `credentials.json`, follow the instructions on the [Google Drive API Go Quickstart](https://developers.google.com/workspace/drive/api/quickstart/go) or follow these steps:
+- Go 1.25 or newer on the build machine.
+- A Linux upstream server or VPS. The examples below assume Ubuntu and user `ubuntu`.
+- A Google Cloud project with the Google Drive API enabled.
+- An OAuth Desktop App credential downloaded as `credentials.json`.
 
-برای دریافت فایل `credentials.json` می‌توانید طبق دستورالعمل‌های موجود در [شروع سریع Google Drive API برای Go](https://developers.google.com/workspace/drive/api/quickstart/go) عمل کنید یا مراحل زیر را انجام دهید:
+Do not commit `credentials.json`, `credentials.json.token`, real config files, or diagnostics. They are ignored by `.gitignore`.
 
-**English:**
-1.  **Enable the API**: Go to the [Google Cloud Console](https://console.cloud.google.com/), create a project, and enable the **Google Drive API**.
-2.  **Configure Consent Screen**: Go to "APIs & Services" > "OAuth consent screen." Fill in the app name and user support email (Branding).
-3.  **Create Credentials**: Go to "Credentials" > "Create Credentials" > **OAuth client ID**. Select **Desktop App** as the application type.
-4.  **Download JSON**: Download the client secret file and rename it to `credentials.json`.
-5.  **Publish App (Optional but Recommended)**: If your app status is "Testing," your token will expire every 7 days. Go to the OAuth consent screen and click "Publish App" to make the authorization permanent for your account.
+### 1. Create Google OAuth Credentials
 
-**فارسی:**
-1.  **فعال‌سازی API**: به [کنسول گوگل کلاود](https://console.cloud.google.com/) بروید، یک پروژه بسازید و **Google Drive API** را فعال کنید.
-2.  **تنظیم صفحه رضایت**: به بخش "APIs & Services" > "OAuth consent screen" بروید. نام برنامه و ایمیل پشتیبانی را وارد کنید (بخش Branding).
-3.  **ساخت اعتبارنامه**: به بخش "Credentials" > "Create Credentials" > **OAuth client ID** بروید. نوع برنامه را **Desktop App** انتخاب کنید.
-4.  **دانلود فایل**: فایل کلاینت سکرت را دانلود کرده و نام آن را به `credentials.json` تغییر دهید.
-5.  **انتشار برنامه (پیشنهادی)**: اگر وضعیت برنامه روی "Testing" باشد، توکن شما هر ۷ روز منقضی می‌شود. در صفحه OAuth consent screen بر روی "Publish App" کلیک کنید تا دسترسی برای اکانت شما دائمی شود.
+1. Open Google Cloud Console and create or select a project.
+2. Enable **Google Drive API**.
+3. Go to **APIs & Services -> OAuth consent screen** and configure the app name, support email, and developer contact email.
+4. If the app is in **Testing**, add the Google account you will use under **Test users**. Otherwise Google may return `Error 403: access_denied`.
+5. Go to **APIs & Services -> Credentials -> Create Credentials -> OAuth client ID**.
+6. Select **Desktop app**.
+7. Download the JSON file and save it in the repository root as `credentials.json`.
 
-### 2. Build Binaries / ساخت فایل‌های اجرایی
+If you want long-lived tokens for your own account, publish the OAuth app after the consent screen is complete. Apps left in Testing can require re-authorization.
+
+### 2. Build Binaries
+
+Build the local client for your machine:
+
 ```bash
 go build -o bin/client ./cmd/client
-go build -o bin/server ./cmd/server
 ```
 
-### 2. Configuration / پیکربندی
+Build the Linux server binary from macOS or another build host:
 
-Create your `config.json` based on the provided examples:
+```bash
+GOOS=linux GOARCH=amd64 go build -o bin/server-linux-amd64 ./cmd/server
+go build -o bin/purge ./cmd/purge
+```
 
-**Client Side (`client_config.json`):**
+### 3. Create Config Files
+
+Start from the examples:
+
+```bash
+cp client_config.json.example client_config.json
+cp server_config.json.example server_config.json
+```
+
+Recommended balanced client config:
+
 ```json
 {
   "listen_addr": "127.0.0.1:1080",
   "storage_type": "google",
-  "google_folder_id": "YOUR_FOLDER_ID",
-  "refresh_rate_ms": 100,
+  "performance_profile": "balanced",
+  "refresh_rate_ms": 200,
   "flush_rate_ms": 300,
+  "idle_poll_max_ms": 2000,
+  "idle_poll_step_ms": 500,
+  "session_idle_timeout_sec": 25,
+  "cleanup_file_max_age_sec": 60,
+  "startup_stale_max_age_sec": 20,
+  "storage_retry_max": 3,
+  "storage_retry_base_ms": 300,
+  "storage_op_timeout_sec": 45,
+  "max_payload_bytes": 786432,
+  "max_active_sessions": 0,
+  "target_metrics_top_n": 10,
+  "blocked_targets": [],
+  "low_priority_targets": [],
+  "session_wait_timeout_sec": 15,
+  "backpressure_bytes": 4194304,
+  "immediate_flush": false,
+  "cold_start_burst_ms": 10000,
+  "cold_start_poll_ms": 100,
+  "metrics_log_sec": 30,
+  "health_listen_addr": "127.0.0.1:18081",
   "transport": {
     "TargetIP": "216.239.38.120:443",
     "SNI": "google.com",
-    "HostHeader": "www.googleapis.com"
-  }
+    "HostHeader": "www.googleapis.com",
+    "InsecureSkipVerify": false
+  },
+  "google_lanes": []
 }
 ```
----
 
-## Performance & Quotas / عملکرد و سهمیه‌ها
+Recommended balanced server config:
 
-### English
-**Important**: Google Drive has strict API rate limits (quotas). 
-- Using very low values (e.g., `refresh_rate_ms: 100`) will consume your API quota very quickly.
-- To avoid connections being limited or blocked, it is recommended to keep these values above **100ms** at all times.
-- For heavy usage or multiple concurrent users, you should set these to **200ms or higher**.
-
-### فارسی
-**نکته مهم**: گوگل درایو محدودیت‌های سفت‌وسختی برای تعداد درخواست‌های API (Quota) دارد.
-- استفاده از مقادیر بسیار پایین (مثلاً `100ms`) باعث می‌شود سهمیه API شما به سرعت تمام شود.
-- برای جلوگیری از محدود شدن یا قطع شدن اتصال، توصیه می‌شود این مقادیر همیشه بالای **100ms** باشند.
-- برای استفاده‌های سنگین یا زمانی که چندین کاربر به صورت هم‌زمان متصل هستند، بهتر است این مقادیر را روی **200ms یا بالاتر** تنظیم کنید.
-
-**Server Side (`server_config.json`):**
 ```json
 {
   "storage_type": "google",
-  "google_folder_id": "YOUR_FOLDER_ID",
-  "refresh_rate_ms": 100,
-  "flush_rate_ms": 300
+  "performance_profile": "balanced",
+  "refresh_rate_ms": 200,
+  "flush_rate_ms": 300,
+  "idle_poll_max_ms": 2000,
+  "idle_poll_step_ms": 500,
+  "session_idle_timeout_sec": 60,
+  "cleanup_file_max_age_sec": 60,
+  "startup_stale_max_age_sec": 20,
+  "storage_retry_max": 3,
+  "storage_retry_base_ms": 300,
+  "storage_op_timeout_sec": 45,
+  "max_payload_bytes": 786432,
+  "max_active_sessions": 20,
+  "session_wait_timeout_sec": 15,
+  "backpressure_bytes": 4194304,
+  "immediate_flush": false,
+  "cold_start_burst_ms": 10000,
+  "cold_start_poll_ms": 100,
+  "metrics_log_sec": 30,
+  "health_listen_addr": "127.0.0.1:18080",
+  "google_lanes": []
 }
 ```
 
-### 3. Run / اجرا
+Leave `google_folder_id` empty for the first local client run. The client will find or create a Google Drive folder named `Flow-Data` and write the folder ID back to `client_config.json`. Copy that same folder ID into `server_config.json`.
 
-**Server:**
-```bash
-./bin/server -c server_config.json -gc credentials.json
-```
+### 4. First Local OAuth Login
 
-**Client:**
+Run the client once locally:
+
 ```bash
 ./bin/client -c client_config.json -gc credentials.json
 ```
 
----
+The client prints a Google OAuth URL. Open it in a browser, approve access, then copy the full redirected `http://localhost/?code=...` URL back into the terminal. It is fine if the browser page itself cannot connect.
 
-## Usage & Authentication / نحوه استفاده و احراز هویت
+After success, the client writes:
 
-### 1. First-Time Authentication / احراز هویت اولیه
-The project uses OAuth2 "3-legged" flow. You only need to do this once on your local machine:
+```text
+credentials.json.token
+```
 
-**English:**
-1.  Run the client: `./bin/client -c client_config.json -gc credentials.json`
-2.  A link will appear in your terminal. **Copy and open it** in your web browser.
-3.  Log in to your Google account and grant permissions.
-4.  You will be redirected to an address starting with `http://localhost` (it's okay if the page doesn't load).
-5.  **Copy the entire URL** from your browser's address bar and paste it back into your terminal.
-6.  The program will create a `.token` file next to your `credentials.json`. Authorization is now complete.
+Keep both `credentials.json` and `credentials.json.token` private.
 
-**فارسی:**
-1. کلاینت را اجرا کنید: `./bin/client -c client_config.json -gc credentials.json`
-2. یک لینک در ترمینال ظاهر می‌شود. آن را کپی کرده و در مرورگر خود باز کنید.
-3. وارد اکانت گوگل خود شوید و دسترسی‌های لازم را تایید کنید.
-4. شما به آدرسی که با `http://localhost` شروع می‌شود هدایت می‌شوید (اشکالی ندارد اگر صفحه باز نشود).
-5. **کل آدرس URL** را از نوار آدرس مرورگر کپی کرده و در ترمینال پیست کنید.
-6. برنامه یک فایل با پسوند `.token` در کنار `credentials.json` شما می‌سازد. احراز هویت تمام شد.
+### 5. Deploy the Server
 
-### 2. Deploying to Server / استقرار در سرور
-Once you have the `.token` file, you don't need to log in again.
+Create the remote directory and copy the server files:
 
-**English:**
-To run the server on a remote upstream machine:
-1.  Copy `credentials.json` **AND** the `.token` file to the server.
-2.  **Crucial**: Make sure your `server_config.json` has the **SAME** `google_folder_id` that the client just created and saved in your local config.
-3.  Run: `./bin/server -c server_config.json -gc credentials.json`
-4.  The server will automatically use the existing token and start immediately.
+```bash
+ssh ubuntu@YOUR_SERVER_IP 'mkdir -p ~/flowdriver'
+scp bin/server-linux-amd64 server_config.json credentials.json credentials.json.token ubuntu@YOUR_SERVER_IP:~/flowdriver/
+```
 
-**فارسی:**
-پس از دریافت فایل `.token` دیگر نیازی به لاگین مجدد نیست. برای اجرای سرور در یک ماشین دور (Upstream):
-1. فایل `credentials.json` **و** فایل `.token` ساخته شده را به سرور منتقل کنید.
-2. **خیلی مهم**: مطمئن شوید که در فایل `server_config.json` مقدار `google_folder_id` دقیقاً همان مقداری باشد که کلاینت به طور خودکار ساخته و در فایل کانفیگ شما ذخیره کرده است.
-3. اجرا کنید: `./bin/server -c server_config.json -gc credentials.json`
-4. سرور به صورت خودکار از توکن موجود استفاده کرده و بلافاصله شروع به کار می‌کند.
+On the server:
+
+```bash
+ssh ubuntu@YOUR_SERVER_IP
+cd ~/flowdriver
+mv server-linux-amd64 server
+chmod +x server
+./server -c server_config.json -gc credentials.json
+```
+
+The server is running correctly when it prints `Starting Flow Server...` and keeps waiting. It only logs more when client traffic arrives.
+
+### 6. Run the Server with systemd
+
+For an always-on Ubuntu service:
+
+```bash
+scp scripts/flowdriver-server.service ubuntu@YOUR_SERVER_IP:/tmp/
+ssh ubuntu@YOUR_SERVER_IP
+sudo mv /tmp/flowdriver-server.service /etc/systemd/system/flowdriver-server.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now flowdriver-server
+sudo systemctl status flowdriver-server --no-pager
+```
+
+Useful service commands:
+
+```bash
+sudo systemctl restart flowdriver-server
+sudo systemctl stop flowdriver-server
+sudo systemctl status flowdriver-server --no-pager
+journalctl -u flowdriver-server -f
+curl http://127.0.0.1:18080/metrics
+```
+
+To update the server binary later:
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o bin/server-linux-amd64 ./cmd/server
+scp bin/server-linux-amd64 server_config.json ubuntu@YOUR_SERVER_IP:~/flowdriver/
+ssh ubuntu@YOUR_SERVER_IP 'cd ~/flowdriver && mv server-linux-amd64 server && chmod +x server && sudo systemctl restart flowdriver-server'
+```
+
+### 7. Run the Client
+
+Run the client locally and keep it open:
+
+```bash
+./bin/client -c client_config.json -gc credentials.json
+```
+
+For logs that are easier to inspect:
+
+```bash
+./bin/client -c client_config.json -gc credentials.json 2>&1 | tee client.log
+```
+
+The local SOCKS5 proxy listens on:
+
+```text
+127.0.0.1:1080
+```
+
+Test with curl:
+
+```bash
+curl -L -x socks5h://127.0.0.1:1080 https://www.google.com -o /dev/null -w 'time_total=%{time_total} starttransfer=%{time_starttransfer} size=%{size_download}\n'
+curl -L -x socks5h://127.0.0.1:1080 https://www.facebook.com -o /dev/null -w 'time_total=%{time_total} starttransfer=%{time_starttransfer} size=%{size_download}\n'
+```
+
+Configure your browser to use SOCKS5 `127.0.0.1:1080`. For browser workloads, expect initial page load latency; once streams start, throughput should be steadier.
+
+### 8. Diagnostics
+
+Client health and metrics:
+
+```bash
+curl http://127.0.0.1:18081/healthz
+curl http://127.0.0.1:18081/metrics
+```
+
+Collect a 5-minute client diagnostic bundle:
+
+```bash
+FLOWDRIVER_SERVER_SSH=ubuntu@YOUR_SERVER_IP \
+FLOWDRIVER_SAMPLE_SECONDS=300 \
+FLOWDRIVER_SAMPLE_INTERVAL=5 \
+FLOWDRIVER_TAIL_LINES=3000 \
+./scripts/collect_client_diagnostics.sh
+```
+
+The script writes a timestamped directory and archive under `diagnostics/`. It does not collect `credentials.json` or `.token` files.
+
+Key metrics to watch:
+
+- `upload_errors`, `download_errors`, `list_errors`, `delete_errors`: should stay at or near zero.
+- `avg_first_upload_ms`: local queue-to-Drive upload latency.
+- `avg_first_server_seen_ms`: how long it takes the server to see a new client request file.
+- `avg_first_response_ms`: time until the client receives first response bytes.
+- `top_targets`: busiest destination hosts with session counts and first-response timing.
+- `poll_files_stale`: old transport leftovers ignored and deleted.
+- `max_file_age_ms`: large values can indicate backlog or old files.
+
+### Runtime Tuning / تنظیمات اجرا
+
+`performance_profile` can be set to:
+
+- `fast`: lower startup latency, higher Google API usage.
+- `balanced`: recommended default for normal browsing and downloads.
+- `quota-saver`: lower API usage, higher startup latency.
+
+Important options:
+
+- `refresh_rate_ms`: how often each side polls for incoming files while active.
+- `flush_rate_ms`: how often buffered data is uploaded.
+- `idle_poll_max_ms`: server-side maximum polling delay while idle.
+- `session_idle_timeout_sec`: inactive connection timeout.
+- `cleanup_file_max_age_sec`: deletes stale transport files.
+- `startup_stale_max_age_sec`: ignores and deletes old transport leftovers before they can pollute cold starts.
+- `storage_retry_max` and `storage_retry_base_ms`: retry policy for transient Google API failures.
+- `storage_op_timeout_sec`: fail-fast timeout for individual Google Drive operations.
+- `max_payload_bytes`: maximum per-session payload size written into one transport file.
+- `max_active_sessions`: cap for concurrent sessions. `0` means unlimited.
+- `target_metrics_top_n`: number of destination hosts exposed under `/metrics` as `top_targets`.
+- `blocked_targets`: optional host globs to reject before tunneling, for example `["*.doubleclick.net"]`.
+- `low_priority_targets`: optional host globs to tunnel without extending the cold-start burst, for noisy browser background services.
+- `session_wait_timeout_sec`: how long new SOCKS sessions wait for capacity.
+- `backpressure_bytes`: per-session buffer limit before application writes wait.
+- `immediate_flush`: uploads new data promptly instead of waiting for the next flush tick. Keep this disabled for browser/video/download workloads because Google Drive generally performs better with batched files.
+- `cold_start_burst_ms`: temporary fast-polling window after a new session starts.
+- `cold_start_poll_ms`: polling interval used during the cold-start burst.
+- `metrics_log_sec`: periodic operational metrics log interval.
+- `health_listen_addr`: optional local HTTP endpoint for `/healthz` and `/metrics`.
+
+Target patterns are lowercase host globs with optional ports. Examples: `*.doubleclick.net`, `mtalk.google.com:*`, `*:5228`. Prefer `low_priority_targets` before `blocked_targets`; blocking can break page assets, while low priority only prevents background connections from consuming cold-start acceleration.
+
+For higher throughput or resilience, configure multiple Google Drive lanes on both client and server:
+
+```json
+{
+  "google_lanes": [
+    {
+      "credentials_path": "credentials.json",
+      "google_folder_id": "LANE_1_FOLDER_ID"
+    },
+    {
+      "credentials_path": "credentials-lane2.json",
+      "google_folder_id": "LANE_2_FOLDER_ID"
+    }
+  ]
+}
+```
+
+Each lane can use a separate Google account or folder. Uploads are distributed across healthy lanes, and a lane with transient failures is temporarily avoided.
+
+### Troubleshooting
+
+- `Error 403: access_denied`: add your Google account as an OAuth test user or publish the app.
+- Browser redirects to `localhost` and fails to load: this is expected. Copy the full URL from the address bar back into the client prompt.
+- Server appears stuck after `Starting Flow Server...`: that is normal while idle. Generate client traffic and watch `journalctl -u flowdriver-server -f`.
+- `scp: stat local ... no such file`: run commands from the repository root, or use full paths.
+- Client metrics show many `context deadline exceeded` errors: reduce browser load, restart both sides, and check Google Drive/API reachability.
+- Large `poll_files_stale` or `max_file_age_ms`: old request/response files are being cleaned up; restart both sides and retest after the folder drains.
