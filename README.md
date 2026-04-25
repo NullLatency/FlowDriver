@@ -155,4 +155,6 @@ To run the server on a remote upstream machine:
 1. فایل `credentials.json` **و** فایل `.token` ساخته شده را به سرور منتقل کنید.
 2. **خیلی مهم**: مطمئن شوید که در فایل `server_config.json` مقدار `google_folder_id` دقیقاً همان مقداری باشد که کلاینت به طور خودکار ساخته و در فایل کانفیگ شما ذخیره کرده است.
 3. اجرا کنید: `./bin/server -c server_config.json -gc credentials.json`
-4. سرور به صورت خودکار از توکن موجود استفاده کرده و بلافاصله شروع به کار می‌کند.
+4. سرور به صورت خودکار از توکن موجود استفاده کرده و بلافاصله شروع به کار می‌کند
+
+now as a genuine questio... wouldnt it be easier to write packets on github and read from it? I feel like google drive was a harder path to take. I didn't know how to comment so I added the question in the read me file
