@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,6 +62,9 @@ type Engine struct {
 	warmUntilNs  int64
 	lastForceNs  int64
 	metrics      engineMetrics
+	targetMu     sync.Mutex
+	targetStats  map[string]*targetMetrics
+	targetTopN   int
 }
 
 type engineMetrics struct {
@@ -98,41 +103,64 @@ type engineMetrics struct {
 	maxFirstServerSeenMs uint64
 }
 
+type targetMetrics struct {
+	target          string
+	sessions        uint64
+	lowPriority     uint64
+	blocked         uint64
+	firstUploads    uint64
+	firstUploadMs   uint64
+	firstResponses  uint64
+	firstResponseMs uint64
+}
+
 type MetricsSnapshot struct {
-	ActiveSessions       int     `json:"active_sessions"`
-	Uploads              uint64  `json:"uploads"`
-	Downloads            uint64  `json:"downloads"`
-	Deletes              uint64  `json:"deletes"`
-	ListCalls            uint64  `json:"list_calls"`
-	UploadBytes          uint64  `json:"upload_bytes"`
-	DownloadBytes        uint64  `json:"download_bytes"`
-	UploadErrors         uint64  `json:"upload_errors"`
-	DownloadErrors       uint64  `json:"download_errors"`
-	ListErrors           uint64  `json:"list_errors"`
-	DeleteErrors         uint64  `json:"delete_errors"`
-	AvgUploadLatencyMs   float64 `json:"avg_upload_latency_ms"`
-	AvgDownloadLatencyMs float64 `json:"avg_download_latency_ms"`
-	AvgListLatencyMs     float64 `json:"avg_list_latency_ms"`
-	AvgDeleteLatencyMs   float64 `json:"avg_delete_latency_ms"`
-	MaxUploadLatencyMs   uint64  `json:"max_upload_latency_ms"`
-	MaxDownloadLatencyMs uint64  `json:"max_download_latency_ms"`
-	MaxListLatencyMs     uint64  `json:"max_list_latency_ms"`
-	MaxDeleteLatencyMs   uint64  `json:"max_delete_latency_ms"`
-	AvgFileAgeMs         float64 `json:"avg_file_age_ms"`
-	MaxFileAgeMs         uint64  `json:"max_file_age_ms"`
-	PollFilesFound       uint64  `json:"poll_files_found"`
-	PollFilesProcessed   uint64  `json:"poll_files_processed"`
-	PollFilesStale       uint64  `json:"poll_files_stale"`
-	MaxPollBatchFiles    uint64  `json:"max_poll_batch_files"`
-	FirstResponses       uint64  `json:"first_responses"`
-	AvgFirstResponseMs   float64 `json:"avg_first_response_ms"`
-	MaxFirstResponseMs   uint64  `json:"max_first_response_ms"`
-	FirstUploads         uint64  `json:"first_uploads"`
-	AvgFirstUploadMs     float64 `json:"avg_first_upload_ms"`
-	MaxFirstUploadMs     uint64  `json:"max_first_upload_ms"`
-	FirstServerSeens     uint64  `json:"first_server_seens"`
-	AvgFirstServerSeenMs float64 `json:"avg_first_server_seen_ms"`
-	MaxFirstServerSeenMs uint64  `json:"max_first_server_seen_ms"`
+	ActiveSessions       int                     `json:"active_sessions"`
+	Uploads              uint64                  `json:"uploads"`
+	Downloads            uint64                  `json:"downloads"`
+	Deletes              uint64                  `json:"deletes"`
+	ListCalls            uint64                  `json:"list_calls"`
+	UploadBytes          uint64                  `json:"upload_bytes"`
+	DownloadBytes        uint64                  `json:"download_bytes"`
+	UploadErrors         uint64                  `json:"upload_errors"`
+	DownloadErrors       uint64                  `json:"download_errors"`
+	ListErrors           uint64                  `json:"list_errors"`
+	DeleteErrors         uint64                  `json:"delete_errors"`
+	AvgUploadLatencyMs   float64                 `json:"avg_upload_latency_ms"`
+	AvgDownloadLatencyMs float64                 `json:"avg_download_latency_ms"`
+	AvgListLatencyMs     float64                 `json:"avg_list_latency_ms"`
+	AvgDeleteLatencyMs   float64                 `json:"avg_delete_latency_ms"`
+	MaxUploadLatencyMs   uint64                  `json:"max_upload_latency_ms"`
+	MaxDownloadLatencyMs uint64                  `json:"max_download_latency_ms"`
+	MaxListLatencyMs     uint64                  `json:"max_list_latency_ms"`
+	MaxDeleteLatencyMs   uint64                  `json:"max_delete_latency_ms"`
+	AvgFileAgeMs         float64                 `json:"avg_file_age_ms"`
+	MaxFileAgeMs         uint64                  `json:"max_file_age_ms"`
+	PollFilesFound       uint64                  `json:"poll_files_found"`
+	PollFilesProcessed   uint64                  `json:"poll_files_processed"`
+	PollFilesStale       uint64                  `json:"poll_files_stale"`
+	MaxPollBatchFiles    uint64                  `json:"max_poll_batch_files"`
+	FirstResponses       uint64                  `json:"first_responses"`
+	AvgFirstResponseMs   float64                 `json:"avg_first_response_ms"`
+	MaxFirstResponseMs   uint64                  `json:"max_first_response_ms"`
+	FirstUploads         uint64                  `json:"first_uploads"`
+	AvgFirstUploadMs     float64                 `json:"avg_first_upload_ms"`
+	MaxFirstUploadMs     uint64                  `json:"max_first_upload_ms"`
+	FirstServerSeens     uint64                  `json:"first_server_seens"`
+	AvgFirstServerSeenMs float64                 `json:"avg_first_server_seen_ms"`
+	MaxFirstServerSeenMs uint64                  `json:"max_first_server_seen_ms"`
+	TopTargets           []TargetMetricsSnapshot `json:"top_targets,omitempty"`
+}
+
+type TargetMetricsSnapshot struct {
+	Target             string  `json:"target"`
+	Sessions           uint64  `json:"sessions"`
+	LowPriority        uint64  `json:"low_priority,omitempty"`
+	Blocked            uint64  `json:"blocked,omitempty"`
+	FirstUploads       uint64  `json:"first_uploads,omitempty"`
+	AvgFirstUploadMs   float64 `json:"avg_first_upload_ms,omitempty"`
+	FirstResponses     uint64  `json:"first_responses,omitempty"`
+	AvgFirstResponseMs float64 `json:"avg_first_response_ms,omitempty"`
 }
 
 func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine {
@@ -160,6 +188,8 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		metricsLogInterval: 30 * time.Second,
 		flushTrigger:       make(chan struct{}, 1),
 		pollTrigger:        make(chan struct{}, 1),
+		targetStats:        make(map[string]*targetMetrics),
+		targetTopN:         10,
 	}
 	if isClient {
 		e.myDir = DirReq
@@ -268,6 +298,12 @@ func (e *Engine) SetMetricsLogInterval(seconds int) {
 	}
 }
 
+func (e *Engine) SetTargetMetricsTopN(n int) {
+	if n >= 0 {
+		e.targetTopN = n
+	}
+}
+
 func (e *Engine) Start(ctx context.Context) {
 	e.TriggerWarmPoll()
 	go e.flushLoop(ctx)
@@ -284,12 +320,25 @@ func (e *Engine) GetSession(id string) *Session {
 
 func (e *Engine) AddSession(s *Session) {
 	s.SetBackpressureBytes(e.backpressureBytes)
+	if s.TargetHost == "" {
+		s.TargetHost = targetKey(s.TargetAddr)
+	}
 	e.sessionMu.Lock()
 	e.sessions[s.ID] = s
 	total := len(e.sessions)
 	e.sessionMu.Unlock()
+	e.recordTargetSession(s.TargetHost, s.LowPriority)
 	log.Printf("Engine.AddSession: Added session %s (Total now: %d)", s.ID, total)
-	e.TriggerWarmPoll()
+	if !s.LowPriority {
+		e.TriggerWarmPoll()
+	}
+}
+
+func (e *Engine) RecordBlockedTarget(targetAddr string) {
+	e.targetMu.Lock()
+	stats := e.targetStatsLocked(targetKey(targetAddr))
+	stats.blocked++
+	e.targetMu.Unlock()
 }
 
 func (e *Engine) RequestFlush() {
@@ -381,6 +430,7 @@ func (e *Engine) Snapshot() MetricsSnapshot {
 		FirstServerSeens:     current.firstServerSeens,
 		AvgFirstServerSeenMs: averageMs(current.firstServerSeenMs, current.firstServerSeens),
 		MaxFirstServerSeenMs: current.maxFirstServerSeenMs,
+		TopTargets:           e.snapshotTopTargets(),
 	}
 }
 
@@ -681,6 +731,7 @@ func (e *Engine) downloadAndProcess(ctx context.Context, fname string, wg *sync.
 			s = NewSession(env.SessionID)
 			s.ClientID = fileClientID
 			s.TargetAddr = env.TargetAddr
+			s.TargetHost = targetKey(env.TargetAddr)
 			e.sessions[env.SessionID] = s
 			e.sessionMu.Unlock()
 			e.recordFirstServerSeen(s, fileAgeMs)
@@ -763,6 +814,7 @@ func (e *Engine) recordFirstResponse(s *Session) {
 	atomic.AddUint64(&e.metrics.firstResponses, 1)
 	atomic.AddUint64(&e.metrics.firstResponseMs, latencyMs)
 	atomicMaxUint64(&e.metrics.maxFirstResponseMs, latencyMs)
+	e.recordTargetFirstResponse(targetAddr, latencyMs)
 	if latencyMs > 2000 {
 		log.Printf("session first response slow: id=%s target=%s first_response_ms=%d", s.ID, targetAddr, latencyMs)
 	}
@@ -794,9 +846,48 @@ func (e *Engine) recordFirstUpload(sessionID string) {
 	atomic.AddUint64(&e.metrics.firstUploads, 1)
 	atomic.AddUint64(&e.metrics.firstUploadMs, latencyMs)
 	atomicMaxUint64(&e.metrics.maxFirstUploadMs, latencyMs)
+	e.recordTargetFirstUpload(targetAddr, latencyMs)
 	if latencyMs > 1000 {
 		log.Printf("session first upload slow: id=%s target=%s first_upload_ms=%d", sessionID, targetAddr, latencyMs)
 	}
+}
+
+func (e *Engine) recordTargetSession(target string, lowPriority bool) {
+	e.targetMu.Lock()
+	stats := e.targetStatsLocked(target)
+	stats.sessions++
+	if lowPriority {
+		stats.lowPriority++
+	}
+	e.targetMu.Unlock()
+}
+
+func (e *Engine) recordTargetFirstUpload(target string, latencyMs uint64) {
+	e.targetMu.Lock()
+	stats := e.targetStatsLocked(targetKey(target))
+	stats.firstUploads++
+	stats.firstUploadMs += latencyMs
+	e.targetMu.Unlock()
+}
+
+func (e *Engine) recordTargetFirstResponse(target string, latencyMs uint64) {
+	e.targetMu.Lock()
+	stats := e.targetStatsLocked(targetKey(target))
+	stats.firstResponses++
+	stats.firstResponseMs += latencyMs
+	e.targetMu.Unlock()
+}
+
+func (e *Engine) targetStatsLocked(target string) *targetMetrics {
+	if target == "" {
+		target = "unknown"
+	}
+	stats := e.targetStats[target]
+	if stats == nil {
+		stats = &targetMetrics{target: target}
+		e.targetStats[target] = stats
+	}
+	return stats
 }
 
 func (e *Engine) recordFirstServerSeen(s *Session, fileAgeMs uint64) {
@@ -914,9 +1005,10 @@ func (e *Engine) metricsLoop(ctx context.Context) {
 			e.sessionMu.RLock()
 			activeSessions := len(e.sessions)
 			e.sessionMu.RUnlock()
+			targets := e.compactTargetLog(5)
 
 			log.Printf(
-				"metrics: active=%d uploads=%d/%s up_avg_ms=%.0f downloads=%d/%s down_avg_ms=%.0f lists=%d list_avg_ms=%.0f poll_files[f=%d p=%d stale=%d max_batch=%d] deletes=%d file_age_avg_ms=%.0f max_file_age_ms=%d first_upload_avg_ms=%.0f first_seen_avg_ms=%.0f first_resp_avg_ms=%.0f errors[u=%d d=%d l=%d del=%d]",
+				"metrics: active=%d uploads=%d/%s up_avg_ms=%.0f downloads=%d/%s down_avg_ms=%.0f lists=%d list_avg_ms=%.0f poll_files[f=%d p=%d stale=%d max_batch=%d] deletes=%d file_age_avg_ms=%.0f max_file_age_ms=%d first_upload_avg_ms=%.0f first_seen_avg_ms=%.0f first_resp_avg_ms=%.0f targets=[%s] errors[u=%d d=%d l=%d del=%d]",
 				activeSessions,
 				current.uploads-last.uploads,
 				formatBytes(current.uploadBytes-last.uploadBytes),
@@ -936,6 +1028,7 @@ func (e *Engine) metricsLoop(ctx context.Context) {
 				averageMs(current.firstUploadMs-last.firstUploadMs, current.firstUploads-last.firstUploads),
 				averageMs(current.firstServerSeenMs-last.firstServerSeenMs, current.firstServerSeens-last.firstServerSeens),
 				averageMs(current.firstResponseMs-last.firstResponseMs, current.firstResponses-last.firstResponses),
+				targets,
 				current.uploadErrors-last.uploadErrors,
 				current.downloadErrors-last.downloadErrors,
 				current.listErrors-last.listErrors,
@@ -982,6 +1075,84 @@ func (e *Engine) snapshotMetrics() engineMetrics {
 		firstServerSeenMs:    atomic.LoadUint64(&e.metrics.firstServerSeenMs),
 		maxFirstServerSeenMs: atomic.LoadUint64(&e.metrics.maxFirstServerSeenMs),
 	}
+}
+
+func (e *Engine) snapshotTopTargets() []TargetMetricsSnapshot {
+	if e.targetTopN == 0 {
+		return nil
+	}
+
+	e.targetMu.Lock()
+	targets := make([]TargetMetricsSnapshot, 0, len(e.targetStats))
+	for _, stats := range e.targetStats {
+		targets = append(targets, TargetMetricsSnapshot{
+			Target:             stats.target,
+			Sessions:           stats.sessions,
+			LowPriority:        stats.lowPriority,
+			Blocked:            stats.blocked,
+			FirstUploads:       stats.firstUploads,
+			AvgFirstUploadMs:   averageMs(stats.firstUploadMs, stats.firstUploads),
+			FirstResponses:     stats.firstResponses,
+			AvgFirstResponseMs: averageMs(stats.firstResponseMs, stats.firstResponses),
+		})
+	}
+	e.targetMu.Unlock()
+
+	sort.Slice(targets, func(i, j int) bool {
+		left := targets[i].Sessions + targets[i].Blocked
+		right := targets[j].Sessions + targets[j].Blocked
+		if left == right {
+			return targets[i].Target < targets[j].Target
+		}
+		return left > right
+	})
+	if e.targetTopN > 0 && len(targets) > e.targetTopN {
+		targets = targets[:e.targetTopN]
+	}
+	return targets
+}
+
+func (e *Engine) compactTargetLog(limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	targets := e.snapshotTopTargets()
+	if len(targets) == 0 {
+		return ""
+	}
+	if len(targets) > limit {
+		targets = targets[:limit]
+	}
+	parts := make([]string, 0, len(targets))
+	for _, t := range targets {
+		label := fmt.Sprintf("%s:%d", t.Target, t.Sessions)
+		if t.LowPriority > 0 {
+			label += fmt.Sprintf("/lp%d", t.LowPriority)
+		}
+		if t.Blocked > 0 {
+			label += fmt.Sprintf("/blk%d", t.Blocked)
+		}
+		if t.AvgFirstResponseMs > 0 {
+			label += fmt.Sprintf("/fr%.0fms", t.AvgFirstResponseMs)
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, ",")
+}
+
+func targetKey(targetAddr string) string {
+	targetAddr = strings.TrimSpace(strings.ToLower(targetAddr))
+	if targetAddr == "" {
+		return "unknown"
+	}
+	host, _, err := net.SplitHostPort(targetAddr)
+	if err == nil {
+		host = strings.Trim(host, "[]")
+		if host != "" {
+			return host
+		}
+	}
+	return strings.Trim(targetAddr, "[]")
 }
 
 func muxPayloadBytes(mux []Envelope) int {

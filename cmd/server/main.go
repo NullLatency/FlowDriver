@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/NullLatency/flow-driver/internal/app"
 	"github.com/NullLatency/flow-driver/internal/config"
@@ -84,6 +85,7 @@ func main() {
 	engine.SetImmediateFlush(appCfg.ImmediateFlush)
 	engine.SetColdStartBurst(appCfg.ColdStartBurstMs, appCfg.ColdStartPollMs)
 	engine.SetMetricsLogInterval(appCfg.MetricsLogSec)
+	engine.SetTargetMetricsTopN(appCfg.TargetMetricsTopN)
 
 	// Called by polling loop when a new incoming session file is found
 	engine.OnNewSession = func(sessionID, targetAddr string, session *transport.Session) {
@@ -104,7 +106,11 @@ func main() {
 func handleServerConn(sessionID, targetAddr string, session *transport.Session, engine *transport.Engine) {
 	defer engine.RemoveSession(sessionID)
 
-	conn, err := net.Dial("tcp", targetAddr)
+	dialer := net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	conn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
 		log.Printf("Dial error to %s: %v", targetAddr, err)
 		// Send back a close packet? Just closing the session will notify client
@@ -116,7 +122,7 @@ func handleServerConn(sessionID, targetAddr string, session *transport.Session, 
 
 	// Conn -> Tx (Res)
 	go func() {
-		buf := make([]byte, 4096)
+		buf := make([]byte, 32*1024)
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {

@@ -69,6 +69,17 @@ type AppConfig struct {
 	// MaxActiveSessions caps concurrent SOCKS sessions on the client side.
 	MaxActiveSessions int `json:"max_active_sessions,omitempty"`
 
+	// BlockedTargets rejects matching SOCKS targets before creating a tunnel session.
+	// Patterns are host globs with optional ports, such as "*.doubleclick.net" or "mtalk.google.com:*".
+	BlockedTargets []string `json:"blocked_targets,omitempty"`
+
+	// LowPriorityTargets still tunnels matching targets, but skips cold-start acceleration for them.
+	// This keeps browser background noise from extending the fast-poll window for foreground pages.
+	LowPriorityTargets []string `json:"low_priority_targets,omitempty"`
+
+	// TargetMetricsTopN controls how many high-traffic targets are exposed in metrics snapshots.
+	TargetMetricsTopN int `json:"target_metrics_top_n,omitempty"`
+
 	// SessionWaitTimeoutSec is how long a new SOCKS connection waits for capacity.
 	SessionWaitTimeoutSec int `json:"session_wait_timeout_sec,omitempty"`
 
@@ -118,6 +129,7 @@ func (c *AppConfig) ApplyProfile() {
 		setDefault(&c.StorageOpTimeoutSec, 45)
 		setDefault(&c.MaxPayloadBytes, 512*1024)
 		setDefault(&c.MaxActiveSessions, 24)
+		setDefault(&c.TargetMetricsTopN, 10)
 		setDefault(&c.SessionWaitTimeoutSec, 12)
 		setDefault(&c.BackpressureBytes, 4*1024*1024)
 		setDefault(&c.ColdStartBurstMs, 15000)
@@ -136,6 +148,7 @@ func (c *AppConfig) ApplyProfile() {
 		setDefault(&c.StorageOpTimeoutSec, 45)
 		setDefault(&c.MaxPayloadBytes, 1024*1024)
 		setDefault(&c.MaxActiveSessions, 16)
+		setDefault(&c.TargetMetricsTopN, 10)
 		setDefault(&c.SessionWaitTimeoutSec, 10)
 		setDefault(&c.BackpressureBytes, 4*1024*1024)
 		setDefault(&c.ColdStartBurstMs, 5000)
@@ -154,6 +167,7 @@ func (c *AppConfig) ApplyProfile() {
 		setDefault(&c.StorageOpTimeoutSec, 45)
 		setDefault(&c.MaxPayloadBytes, 768*1024)
 		setDefault(&c.MaxActiveSessions, 24)
+		setDefault(&c.TargetMetricsTopN, 10)
 		setDefault(&c.SessionWaitTimeoutSec, 12)
 		setDefault(&c.BackpressureBytes, 4*1024*1024)
 		setDefault(&c.ColdStartBurstMs, 10000)

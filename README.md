@@ -96,6 +96,9 @@ Recommended balanced client config:
   "storage_op_timeout_sec": 45,
   "max_payload_bytes": 786432,
   "max_active_sessions": 0,
+  "target_metrics_top_n": 10,
+  "blocked_targets": [],
+  "low_priority_targets": [],
   "session_wait_timeout_sec": 15,
   "backpressure_bytes": 4194304,
   "immediate_flush": false,
@@ -270,6 +273,7 @@ Key metrics to watch:
 - `avg_first_upload_ms`: local queue-to-Drive upload latency.
 - `avg_first_server_seen_ms`: how long it takes the server to see a new client request file.
 - `avg_first_response_ms`: time until the client receives first response bytes.
+- `top_targets`: busiest destination hosts with session counts and first-response timing.
 - `poll_files_stale`: old transport leftovers ignored and deleted.
 - `max_file_age_ms`: large values can indicate backlog or old files.
 
@@ -293,6 +297,9 @@ Important options:
 - `storage_op_timeout_sec`: fail-fast timeout for individual Google Drive operations.
 - `max_payload_bytes`: maximum per-session payload size written into one transport file.
 - `max_active_sessions`: cap for concurrent sessions. `0` means unlimited.
+- `target_metrics_top_n`: number of destination hosts exposed under `/metrics` as `top_targets`.
+- `blocked_targets`: optional host globs to reject before tunneling, for example `["*.doubleclick.net"]`.
+- `low_priority_targets`: optional host globs to tunnel without extending the cold-start burst, for noisy browser background services.
 - `session_wait_timeout_sec`: how long new SOCKS sessions wait for capacity.
 - `backpressure_bytes`: per-session buffer limit before application writes wait.
 - `immediate_flush`: uploads new data promptly instead of waiting for the next flush tick. Keep this disabled for browser/video/download workloads because Google Drive generally performs better with batched files.
@@ -300,6 +307,8 @@ Important options:
 - `cold_start_poll_ms`: polling interval used during the cold-start burst.
 - `metrics_log_sec`: periodic operational metrics log interval.
 - `health_listen_addr`: optional local HTTP endpoint for `/healthz` and `/metrics`.
+
+Target patterns are lowercase host globs with optional ports. Examples: `*.doubleclick.net`, `mtalk.google.com:*`, `*:5228`. Prefer `low_priority_targets` before `blocked_targets`; blocking can break page assets, while low priority only prevents background connections from consuming cold-start acceleration.
 
 For higher throughput or resilience, configure multiple Google Drive lanes on both client and server:
 

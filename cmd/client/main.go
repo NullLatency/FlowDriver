@@ -11,6 +11,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path"
+	"strings"
 	"syscall"
 	"time"
 
@@ -107,6 +109,7 @@ func main() {
 	engine.SetImmediateFlush(appCfg.ImmediateFlush)
 	engine.SetColdStartBurst(appCfg.ColdStartBurstMs, appCfg.ColdStartPollMs)
 	engine.SetMetricsLogInterval(appCfg.MetricsLogSec)
+	engine.SetTargetMetricsTopN(appCfg.TargetMetricsTopN)
 	engine.Start(ctx)
 	health.Start(ctx, appCfg.HealthListenAddr, engine)
 
@@ -114,10 +117,19 @@ func main() {
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:1080"
 	}
+	policy := newTargetPolicy(appCfg.BlockedTargets, appCfg.LowPriorityTargets)
 
 	// Create the library SOCKS5 server wrapping our custom Google Drive Engine tunnel
 	server := socks5.NewServer(
 		socks5.WithDial(func(dc context.Context, network, addr string) (net.Conn, error) {
+			host, port, hasHostPort := splitTarget(addr)
+			if policy.blocked(host, port, addr) {
+				engine.RecordBlockedTarget(addr)
+				log.Printf("Blocked target by policy: %s", addr)
+				return nil, fmt.Errorf("target blocked by policy: %s", addr)
+			}
+			lowPriority := policy.lowPriority(host, port, addr)
+
 			if err := waitForSessionCapacity(dc, engine, appCfg.MaxActiveSessions, appCfg.SessionWaitTimeoutSec); err != nil {
 				return nil, err
 			}
@@ -125,25 +137,32 @@ func main() {
 			sessionID := generateSessionID()
 
 			// Intelligently parse the address string to warn users if their browser is natively leaking DNS
-			host, port, err := net.SplitHostPort(addr)
-			if err == nil {
+			priorityLabel := ""
+			if lowPriority {
+				priorityLabel = " LOW-PRIORITY"
+			}
+			if hasHostPort {
 				if net.ParseIP(host) != nil {
-					log.Printf("New covert session %s targeting RAW IP %s:%s (Warning: Local DNS Leak?)", sessionID, host, port)
+					log.Printf("New covert session %s%s targeting RAW IP %s:%s (Warning: Local DNS Leak?)", sessionID, priorityLabel, host, port)
 				} else {
-					log.Printf("New covert session %s targeting SECURE DOMAIN %s:%s", sessionID, host, port)
+					log.Printf("New covert session %s%s targeting SECURE DOMAIN %s:%s", sessionID, priorityLabel, host, port)
 				}
 			} else {
-				log.Printf("New covert session %s targeting %s", sessionID, addr)
+				log.Printf("New covert session %s%s targeting %s", sessionID, priorityLabel, addr)
 			}
 
 			session := transport.NewSession(sessionID)
 			session.TargetAddr = addr
+			session.TargetHost = host
+			session.LowPriority = lowPriority
 			engine.AddSession(session)
 
 			// Instantly ping a blank payload so the remote end opens the actual TCP destination
 			session.EnqueueTx(nil)
-			engine.TriggerWarmPoll()
-			engine.ForceFlush()
+			if !lowPriority {
+				engine.TriggerWarmPoll()
+				engine.ForceFlush()
+			}
 
 			return transport.NewVirtualConn(session, engine), nil
 		}),
@@ -171,6 +190,107 @@ func main() {
 	<-sigCh
 	log.Println("Shutting down client...")
 	cancel()
+}
+
+type targetPolicy struct {
+	blockedTargets     []targetPattern
+	lowPriorityTargets []targetPattern
+}
+
+type targetPattern struct {
+	raw  string
+	host string
+	port string
+}
+
+func newTargetPolicy(blocked, lowPriority []string) targetPolicy {
+	return targetPolicy{
+		blockedTargets:     parseTargetPatterns(blocked),
+		lowPriorityTargets: parseTargetPatterns(lowPriority),
+	}
+}
+
+func parseTargetPatterns(values []string) []targetPattern {
+	patterns := make([]targetPattern, 0, len(values))
+	for _, value := range values {
+		raw := strings.TrimSpace(strings.ToLower(value))
+		if raw == "" {
+			continue
+		}
+		host, port, ok := splitPattern(raw)
+		if !ok {
+			host = raw
+		}
+		patterns = append(patterns, targetPattern{raw: raw, host: host, port: port})
+	}
+	return patterns
+}
+
+func splitPattern(value string) (host, port string, ok bool) {
+	if strings.HasPrefix(value, "[") {
+		host, port, err := net.SplitHostPort(value)
+		if err == nil {
+			return strings.Trim(host, "[]"), port, true
+		}
+	}
+	lastColon := strings.LastIndex(value, ":")
+	if lastColon <= 0 {
+		return "", "", false
+	}
+	host = value[:lastColon]
+	port = value[lastColon+1:]
+	if host == "" || port == "" {
+		return "", "", false
+	}
+	return strings.Trim(host, "[]"), port, true
+}
+
+func (p targetPolicy) blocked(host, port, raw string) bool {
+	return targetPatternsMatch(p.blockedTargets, host, port, raw)
+}
+
+func (p targetPolicy) lowPriority(host, port, raw string) bool {
+	return targetPatternsMatch(p.lowPriorityTargets, host, port, raw)
+}
+
+func targetPatternsMatch(patterns []targetPattern, host, port, raw string) bool {
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	port = strings.ToLower(port)
+	raw = strings.ToLower(raw)
+	for _, pattern := range patterns {
+		if pattern.match(host, port, raw) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p targetPattern) match(host, port, raw string) bool {
+	if p.port != "" && p.port != "*" && p.port != port {
+		return false
+	}
+
+	patternHost := p.host
+	if patternHost == "" {
+		patternHost = p.raw
+	}
+	if matched, err := path.Match(patternHost, host); err == nil && matched {
+		return true
+	}
+	if p.port == "" {
+		if matched, err := path.Match(p.raw, raw); err == nil && matched {
+			return true
+		}
+	}
+	return patternHost == host || (p.port == "" && p.raw == raw)
+}
+
+func splitTarget(addr string) (host, port string, ok bool) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return strings.ToLower(strings.Trim(addr, "[]")), "", false
+	}
+	return strings.ToLower(strings.Trim(host, "[]")), strings.ToLower(port), true
 }
 
 func waitForSessionCapacity(ctx context.Context, engine *transport.Engine, maxActive, timeoutSec int) error {

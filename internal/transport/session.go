@@ -30,7 +30,9 @@ type Session struct {
 	closed              bool
 	rxClosed            bool // Safely tracks if RxChan was successfully closed
 	TargetAddr          string
+	TargetHost          string
 	ClientID            string
+	LowPriority         bool
 
 	// Backpressure: blocked when txBuf is too large
 	txCond            *sync.Cond
