@@ -77,10 +77,12 @@ func main() {
 	engine.SetIdlePollStep(appCfg.IdlePollStepMs)
 	engine.SetSessionIdleTimeout(appCfg.SessionIdleTimeoutSec)
 	engine.SetCleanupFileMaxAge(appCfg.CleanupFileMaxAgeSec)
+	engine.SetStartupStaleMaxAge(appCfg.StartupStaleMaxAgeSec)
 	engine.SetMaxPayloadBytes(appCfg.MaxPayloadBytes)
 	engine.SetBackpressureBytes(appCfg.BackpressureBytes)
 	engine.SetStorageOpTimeout(appCfg.StorageOpTimeoutSec)
 	engine.SetImmediateFlush(appCfg.ImmediateFlush)
+	engine.SetColdStartBurst(appCfg.ColdStartBurstMs, appCfg.ColdStartPollMs)
 	engine.SetMetricsLogInterval(appCfg.MetricsLogSec)
 
 	// Called by polling loop when a new incoming session file is found
@@ -118,8 +120,13 @@ func handleServerConn(sessionID, targetAddr string, session *transport.Session, 
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
-				session.EnqueueTx(buf[:n])
-				engine.RequestFlush()
+				firstPacket := session.EnqueueTx(buf[:n])
+				if firstPacket {
+					engine.TriggerWarmPoll()
+					engine.ForceFlush()
+				} else {
+					engine.RequestFlush()
+				}
 			}
 			if err != nil {
 				errCh <- err

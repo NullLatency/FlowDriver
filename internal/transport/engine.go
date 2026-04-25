@@ -35,10 +35,14 @@ type Engine struct {
 	idlePollStep       time.Duration
 	sessionIdleTimeout time.Duration
 	cleanupFileMaxAge  time.Duration
+	startupStaleMaxAge time.Duration
 	maxPayloadBytes    int
 	backpressureBytes  int
 	storageOpTimeout   time.Duration
 	immediateFlush     bool
+	coldStartBurst     time.Duration
+	coldStartPoll      time.Duration
+	forceFlushMinGap   time.Duration
 	metricsLogInterval time.Duration
 
 	// Server mode handler: called when a new session is discovered
@@ -52,6 +56,9 @@ type Engine struct {
 	processedMu sync.Mutex
 
 	flushTrigger chan struct{}
+	pollTrigger  chan struct{}
+	warmUntilNs  int64
+	lastForceNs  int64
 	metrics      engineMetrics
 }
 
@@ -76,9 +83,19 @@ type engineMetrics struct {
 	maxDeleteLatencyMs   uint64
 	fileAgeMs            uint64
 	maxFileAgeMs         uint64
+	pollFilesFound       uint64
+	pollFilesProcessed   uint64
+	pollFilesStale       uint64
+	maxPollBatchFiles    uint64
 	firstResponses       uint64
 	firstResponseMs      uint64
 	maxFirstResponseMs   uint64
+	firstUploads         uint64
+	firstUploadMs        uint64
+	maxFirstUploadMs     uint64
+	firstServerSeens     uint64
+	firstServerSeenMs    uint64
+	maxFirstServerSeenMs uint64
 }
 
 type MetricsSnapshot struct {
@@ -103,9 +120,19 @@ type MetricsSnapshot struct {
 	MaxDeleteLatencyMs   uint64  `json:"max_delete_latency_ms"`
 	AvgFileAgeMs         float64 `json:"avg_file_age_ms"`
 	MaxFileAgeMs         uint64  `json:"max_file_age_ms"`
+	PollFilesFound       uint64  `json:"poll_files_found"`
+	PollFilesProcessed   uint64  `json:"poll_files_processed"`
+	PollFilesStale       uint64  `json:"poll_files_stale"`
+	MaxPollBatchFiles    uint64  `json:"max_poll_batch_files"`
 	FirstResponses       uint64  `json:"first_responses"`
 	AvgFirstResponseMs   float64 `json:"avg_first_response_ms"`
 	MaxFirstResponseMs   uint64  `json:"max_first_response_ms"`
+	FirstUploads         uint64  `json:"first_uploads"`
+	AvgFirstUploadMs     float64 `json:"avg_first_upload_ms"`
+	MaxFirstUploadMs     uint64  `json:"max_first_upload_ms"`
+	FirstServerSeens     uint64  `json:"first_server_seens"`
+	AvgFirstServerSeenMs float64 `json:"avg_first_server_seen_ms"`
+	MaxFirstServerSeenMs uint64  `json:"max_first_server_seen_ms"`
 }
 
 func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine {
@@ -122,12 +149,17 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		idlePollStep:       500 * time.Millisecond,
 		sessionIdleTimeout: 10 * time.Second,
 		cleanupFileMaxAge:  10 * time.Second,
+		startupStaleMaxAge: 20 * time.Second,
 		maxPayloadBytes:    768 * 1024,
 		backpressureBytes:  2 * 1024 * 1024,
 		storageOpTimeout:   18 * time.Second,
 		immediateFlush:     false,
+		coldStartBurst:     10 * time.Second,
+		coldStartPoll:      100 * time.Millisecond,
+		forceFlushMinGap:   100 * time.Millisecond,
 		metricsLogInterval: 30 * time.Second,
 		flushTrigger:       make(chan struct{}, 1),
+		pollTrigger:        make(chan struct{}, 1),
 	}
 	if isClient {
 		e.myDir = DirReq
@@ -187,6 +219,12 @@ func (e *Engine) SetCleanupFileMaxAge(seconds int) {
 	}
 }
 
+func (e *Engine) SetStartupStaleMaxAge(seconds int) {
+	if seconds > 0 {
+		e.startupStaleMaxAge = time.Duration(seconds) * time.Second
+	}
+}
+
 func (e *Engine) SetMaxPayloadBytes(bytes int) {
 	if bytes > 0 {
 		e.maxPayloadBytes = bytes
@@ -209,6 +247,15 @@ func (e *Engine) SetImmediateFlush(enabled bool) {
 	e.immediateFlush = enabled
 }
 
+func (e *Engine) SetColdStartBurst(burstMs, pollMs int) {
+	if burstMs > 0 {
+		e.coldStartBurst = time.Duration(burstMs) * time.Millisecond
+	}
+	if pollMs > 0 {
+		e.coldStartPoll = time.Duration(pollMs) * time.Millisecond
+	}
+}
+
 func (e *Engine) ActiveSessionCount() int {
 	e.sessionMu.RLock()
 	defer e.sessionMu.RUnlock()
@@ -222,6 +269,7 @@ func (e *Engine) SetMetricsLogInterval(seconds int) {
 }
 
 func (e *Engine) Start(ctx context.Context) {
+	e.TriggerWarmPoll()
 	go e.flushLoop(ctx)
 	go e.pollLoop(ctx)
 	go e.cleanupLoop(ctx) // Delete files older than 10s
@@ -237,20 +285,59 @@ func (e *Engine) GetSession(id string) *Session {
 func (e *Engine) AddSession(s *Session) {
 	s.SetBackpressureBytes(e.backpressureBytes)
 	e.sessionMu.Lock()
-	defer e.sessionMu.Unlock()
 	e.sessions[s.ID] = s
-	log.Printf("Engine.AddSession: Added session %s (Total now: %d)", s.ID, len(e.sessions))
-	e.RequestFlush()
+	total := len(e.sessions)
+	e.sessionMu.Unlock()
+	log.Printf("Engine.AddSession: Added session %s (Total now: %d)", s.ID, total)
+	e.TriggerWarmPoll()
 }
 
 func (e *Engine) RequestFlush() {
 	if !e.immediateFlush {
 		return
 	}
+	e.ForceFlush()
+}
+
+func (e *Engine) ForceFlush() {
+	if e.forceFlushMinGap > 0 {
+		now := time.Now().UnixNano()
+		last := atomic.LoadInt64(&e.lastForceNs)
+		if last > 0 && time.Duration(now-last) < e.forceFlushMinGap {
+			return
+		}
+		if !atomic.CompareAndSwapInt64(&e.lastForceNs, last, now) {
+			return
+		}
+	}
 	select {
 	case e.flushTrigger <- struct{}{}:
 	default:
 	}
+}
+
+func (e *Engine) TriggerWarmPoll() {
+	if e.coldStartBurst <= 0 {
+		return
+	}
+	until := time.Now().Add(e.coldStartBurst).UnixNano()
+	for {
+		current := atomic.LoadInt64(&e.warmUntilNs)
+		if until <= current {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&e.warmUntilNs, current, until) {
+			break
+		}
+	}
+	select {
+	case e.pollTrigger <- struct{}{}:
+	default:
+	}
+}
+
+func (e *Engine) coldStartActive() bool {
+	return time.Now().UnixNano() < atomic.LoadInt64(&e.warmUntilNs)
 }
 
 func (e *Engine) Snapshot() MetricsSnapshot {
@@ -281,9 +368,19 @@ func (e *Engine) Snapshot() MetricsSnapshot {
 		MaxDeleteLatencyMs:   current.maxDeleteLatencyMs,
 		AvgFileAgeMs:         averageMs(current.fileAgeMs, current.downloads),
 		MaxFileAgeMs:         current.maxFileAgeMs,
+		PollFilesFound:       current.pollFilesFound,
+		PollFilesProcessed:   current.pollFilesProcessed,
+		PollFilesStale:       current.pollFilesStale,
+		MaxPollBatchFiles:    current.maxPollBatchFiles,
 		FirstResponses:       current.firstResponses,
 		AvgFirstResponseMs:   averageMs(current.firstResponseMs, current.firstResponses),
 		MaxFirstResponseMs:   current.maxFirstResponseMs,
+		FirstUploads:         current.firstUploads,
+		AvgFirstUploadMs:     averageMs(current.firstUploadMs, current.firstUploads),
+		MaxFirstUploadMs:     current.maxFirstUploadMs,
+		FirstServerSeens:     current.firstServerSeens,
+		AvgFirstServerSeenMs: averageMs(current.firstServerSeenMs, current.firstServerSeens),
+		MaxFirstServerSeenMs: current.maxFirstServerSeenMs,
 	}
 }
 
@@ -375,9 +472,10 @@ func (e *Engine) flushAll(ctx context.Context) {
 		}
 		filename := fmt.Sprintf("%s-%s-mux-%d.bin", e.myDir, fnameCID, time.Now().UnixNano())
 		payloadBytes := muxPayloadBytes(mux)
+		firstUploadSessionIDs := firstUploadCandidates(mux)
 
 		// Upload asynchronously with backpressure/limit
-		go func(fname string, m []Envelope, bytes int) {
+		go func(fname string, m []Envelope, bytes int, firstIDs []string) {
 			e.sem <- struct{}{}        // Acquire
 			defer func() { <-e.sem }() // Release
 
@@ -406,14 +504,17 @@ func (e *Engine) flushAll(ctx context.Context) {
 			atomic.AddUint64(&e.metrics.uploadBytes, uint64(bytes))
 			atomic.AddUint64(&e.metrics.uploadLatencyMs, latencyMs)
 			atomicMaxUint64(&e.metrics.maxUploadLatencyMs, latencyMs)
-		}(filename, mux, payloadBytes)
+			for _, sessionID := range firstIDs {
+				e.recordFirstUpload(sessionID)
+			}
+		}(filename, mux, payloadBytes, firstUploadSessionIDs)
 	}
 
 	for _, id := range closedSessionIDs {
 		e.RemoveSession(id)
 	}
 	if needsFollowupFlush {
-		e.RequestFlush()
+		e.ForceFlush()
 	}
 }
 
@@ -426,195 +527,187 @@ func (e *Engine) pollLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-e.pollTrigger:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		case <-timer.C:
-		pollAgain:
-			// ZERO-TRAFFIC CLIENT OPTIMIZATION:
-			// SOCKS5 only initiates from the Client. If the Client has 0 active sessions,
-			// it mathematically never needs to poll Google Drive! Go entirely to sleep!
-			if e.myDir == DirReq {
-				e.sessionMu.RLock()
-				count := len(e.sessions)
-				e.sessionMu.RUnlock()
-				if count == 0 {
-					timer.Reset(currentPollInterval)
-					continue
-				}
-			}
+		}
 
-			// Fetch multiplexed files
-			prefix := string(e.peerDir) + "-"
-			if e.myDir == DirReq {
-				// Client only polls for its own responses
-				prefix += e.id + "-mux-"
-			} else {
-				// Server polls for ALL client requests
-				prefix += ""
-			}
-			listStart := time.Now()
-			opCtx, cancel := e.storageContext(ctx)
-			files, err := e.backend.ListQuery(opCtx, prefix)
-			cancel()
-			if err != nil {
-				atomic.AddUint64(&e.metrics.listErrors, 1)
-				log.Printf("poll list error: %v", err)
-				timer.Reset(currentPollInterval)
+	pollAgain:
+		if e.myDir == DirReq {
+			count := e.ActiveSessionCount()
+			if count == 0 {
+				timer.Reset(e.effectivePollInterval(currentPollInterval, count))
 				continue
 			}
-			listLatencyMs := uint64(time.Since(listStart).Milliseconds())
-			atomic.AddUint64(&e.metrics.listCalls, 1)
-			atomic.AddUint64(&e.metrics.listLatencyMs, listLatencyMs)
-			atomicMaxUint64(&e.metrics.maxListLatencyMs, listLatencyMs)
+		}
 
-			if len(files) == 0 {
-				if e.myDir == DirRes { // SERVER OPTIMIZATION
-					e.sessionMu.RLock()
-					activeSessions := len(e.sessions)
-					e.sessionMu.RUnlock()
+		// Fetch multiplexed files
+		prefix := string(e.peerDir) + "-"
+		if e.myDir == DirReq {
+			// Client only polls for its own responses
+			prefix += e.id + "-mux-"
+		} else {
+			// Server polls for ALL client requests
+			prefix += ""
+		}
+		listStart := time.Now()
+		opCtx, cancel := e.storageContext(ctx)
+		files, err := e.backend.ListQuery(opCtx, prefix)
+		cancel()
+		if err != nil {
+			atomic.AddUint64(&e.metrics.listErrors, 1)
+			log.Printf("poll list error: %v", err)
+			timer.Reset(e.effectivePollInterval(currentPollInterval, e.ActiveSessionCount()))
+			continue
+		}
+		listLatencyMs := uint64(time.Since(listStart).Milliseconds())
+		atomic.AddUint64(&e.metrics.listCalls, 1)
+		atomic.AddUint64(&e.metrics.listLatencyMs, listLatencyMs)
+		atomicMaxUint64(&e.metrics.maxListLatencyMs, listLatencyMs)
+		atomic.AddUint64(&e.metrics.pollFilesFound, uint64(len(files)))
+		atomicMaxUint64(&e.metrics.maxPollBatchFiles, uint64(len(files)))
 
-					if activeSessions == 0 {
-						// Increase polling delay step-by-step to save API calls
-						currentPollInterval += e.idlePollStep
-						if currentPollInterval > e.idlePollMax {
-							currentPollInterval = e.idlePollMax
-						}
-					} else {
-						// A session is currently active, so loop fast!
-						currentPollInterval = e.pollTicker
+		if len(files) == 0 {
+			activeSessions := e.ActiveSessionCount()
+			if e.myDir == DirRes {
+				if activeSessions == 0 && !e.coldStartActive() {
+					currentPollInterval += e.idlePollStep
+					if currentPollInterval > e.idlePollMax {
+						currentPollInterval = e.idlePollMax
 					}
+				} else {
+					currentPollInterval = e.pollTicker
 				}
-				// Client optimization doesn't change intervals, but needs its timer reset
-				timer.Reset(currentPollInterval)
+			}
+			timer.Reset(e.effectivePollInterval(currentPollInterval, activeSessions))
+			continue
+		}
+
+		currentPollInterval = e.pollTicker
+
+		var wg sync.WaitGroup
+		for _, f := range files {
+			fileAge := fileAgeDuration(f)
+			if e.shouldDropStaleFile(fileAge) {
+				atomic.AddUint64(&e.metrics.pollFilesStale, 1)
+				if fileAge > 0 {
+					atomicMaxUint64(&e.metrics.maxFileAgeMs, uint64(fileAge.Milliseconds()))
+				}
+				log.Printf("stale transport file ignored: file=%s age_ms=%d", f, fileAge.Milliseconds())
+				e.deleteAsync(ctx, f)
 				continue
 			}
 
-			// We found data! Reset polling back to maximum speed
-			currentPollInterval = e.pollTicker
+			e.processedMu.Lock()
+			already := e.processed[f]
+			if !already {
+				e.processed[f] = true
+			}
+			e.processedMu.Unlock()
 
-			// We found files! Let's download them in parallel to boost speed massively
-			var wg sync.WaitGroup
-			for _, f := range files {
-				// STARTUP OPTIMIZATION: Ignore files older than 5 minutes to avoid memory spikes on restart
-				parts := strings.Split(f, "-")
-				if len(parts) >= 3 {
-					tsStr := parts[len(parts)-1]
-					tsStr = strings.TrimSuffix(tsStr, ".bin")
-					ts, _ := strconv.ParseInt(tsStr, 10, 64)
-					if ts > 0 && time.Since(time.Unix(0, ts)) > e.cleanupFileMaxAge {
-						e.deleteAsync(ctx, f) // Silent cleanup
-						continue
-					}
-				}
-
-				e.processedMu.Lock()
-				already := e.processed[f]
-				if !already {
-					e.processed[f] = true
-				}
-				e.processedMu.Unlock()
-
-				if already {
-					continue
-				}
-
-				wg.Add(1)
-				go func(fname string) {
-					defer wg.Done()
-
-					e.sem <- struct{}{}        // Acquire
-					defer func() { <-e.sem }() // Release
-
-					// log.Printf("Engine.pollLoop: Downloading %s", fname)
-					downloadStart := time.Now()
-					opCtx, cancel := e.storageContext(ctx)
-					rc, err := e.backend.Download(opCtx, fname)
-					if err != nil {
-						cancel()
-						atomic.AddUint64(&e.metrics.downloadErrors, 1)
-						log.Printf("download error %s: %v", fname, err)
-						e.processedMu.Lock()
-						delete(e.processed, fname) // failed to download, retry next poll
-						e.processedMu.Unlock()
-						return
-					}
-					defer func() {
-						rc.Close()
-						cancel()
-					}()
-					downloadLatencyMs := uint64(time.Since(downloadStart).Milliseconds())
-					fileAgeMs := fileAgeMilliseconds(fname)
-
-					// Extract ClientID from filename for server-side session initialization
-					var fileClientID string
-					parts := strings.Split(fname, "-")
-					if len(parts) >= 4 && parts[2] == "mux" {
-						fileClientID = parts[1]
-					}
-
-					// STREAMING DECODE
-					count := 0
-					payloadBytes := 0
-					for {
-						var env Envelope
-						if err := env.Decode(rc); err != nil {
-							if err != io.EOF && err != io.ErrUnexpectedEOF {
-								log.Printf("mux decode error %s: %v", fname, err)
-							}
-							break
-						}
-						count++
-						payloadBytes += len(env.Payload)
-
-						// Process envelope immediately
-						e.closedSessionsMu.Lock()
-						if _, exists := e.closedSessions[env.SessionID]; exists {
-							e.closedSessionsMu.Unlock()
-							continue
-						}
-						e.closedSessionsMu.Unlock()
-
-						e.sessionMu.Lock()
-						s, exists := e.sessions[env.SessionID]
-						if !exists && e.myDir == DirRes && e.OnNewSession != nil {
-							s = NewSession(env.SessionID)
-							s.ClientID = fileClientID
-							s.TargetAddr = env.TargetAddr
-							e.sessions[env.SessionID] = s
-							e.sessionMu.Unlock()
-							log.Printf("Engine: Triggering new session %s for Client %s", env.SessionID, fileClientID)
-							e.OnNewSession(env.SessionID, env.TargetAddr, s)
-						} else {
-							e.sessionMu.Unlock()
-						}
-
-						if s != nil {
-							if len(env.Payload) > 0 {
-								e.recordFirstResponse(s)
-							}
-							s.ProcessRx(&env)
-						}
-					}
-
-					atomic.AddUint64(&e.metrics.downloads, 1)
-					atomic.AddUint64(&e.metrics.downloadBytes, uint64(payloadBytes))
-					atomic.AddUint64(&e.metrics.downloadLatencyMs, downloadLatencyMs)
-					atomicMaxUint64(&e.metrics.maxDownloadLatencyMs, downloadLatencyMs)
-					if fileAgeMs > 0 {
-						atomic.AddUint64(&e.metrics.fileAgeMs, fileAgeMs)
-						atomicMaxUint64(&e.metrics.maxFileAgeMs, fileAgeMs)
-					}
-					e.deleteAsync(ctx, fname)
-				}(f)
+			if already {
+				continue
 			}
 
-			// Wait for parallel batch to finish
-			wg.Wait()
+			wg.Add(1)
+			atomic.AddUint64(&e.metrics.pollFilesProcessed, 1)
+			go e.downloadAndProcess(ctx, f, &wg)
+		}
 
-			// Adaptive Polling: Because we just received data, the connection is active.
-			// Instead of jumping back to the select, immediately poll again after a tiny 100ms break to drain queues.
-			time.Sleep(100 * time.Millisecond)
-			goto pollAgain
+		wg.Wait()
+		time.Sleep(e.effectivePollInterval(100*time.Millisecond, e.ActiveSessionCount()))
+		goto pollAgain
+	}
+}
+
+func (e *Engine) downloadAndProcess(ctx context.Context, fname string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	e.sem <- struct{}{}
+	defer func() { <-e.sem }()
+
+	downloadStart := time.Now()
+	opCtx, cancel := e.storageContext(ctx)
+	rc, err := e.backend.Download(opCtx, fname)
+	if err != nil {
+		cancel()
+		atomic.AddUint64(&e.metrics.downloadErrors, 1)
+		log.Printf("download error %s: %v", fname, err)
+		e.processedMu.Lock()
+		delete(e.processed, fname)
+		e.processedMu.Unlock()
+		return
+	}
+	defer func() {
+		rc.Close()
+		cancel()
+	}()
+
+	downloadLatencyMs := uint64(time.Since(downloadStart).Milliseconds())
+	fileAgeMs := fileAgeMilliseconds(fname)
+
+	var fileClientID string
+	parts := strings.Split(fname, "-")
+	if len(parts) >= 4 && parts[2] == "mux" {
+		fileClientID = parts[1]
+	}
+
+	payloadBytes := 0
+	for {
+		var env Envelope
+		if err := env.Decode(rc); err != nil {
+			if err != io.EOF && err != io.ErrUnexpectedEOF {
+				log.Printf("mux decode error %s: %v", fname, err)
+			}
+			break
+		}
+		payloadBytes += len(env.Payload)
+
+		e.closedSessionsMu.Lock()
+		if _, exists := e.closedSessions[env.SessionID]; exists {
+			e.closedSessionsMu.Unlock()
+			continue
+		}
+		e.closedSessionsMu.Unlock()
+
+		e.sessionMu.Lock()
+		s, exists := e.sessions[env.SessionID]
+		if !exists && e.myDir == DirRes && e.OnNewSession != nil {
+			s = NewSession(env.SessionID)
+			s.ClientID = fileClientID
+			s.TargetAddr = env.TargetAddr
+			e.sessions[env.SessionID] = s
+			e.sessionMu.Unlock()
+			e.recordFirstServerSeen(s, fileAgeMs)
+			log.Printf("Engine: Triggering new session %s for Client %s", env.SessionID, fileClientID)
+			e.TriggerWarmPoll()
+			e.OnNewSession(env.SessionID, env.TargetAddr, s)
+		} else {
+			e.sessionMu.Unlock()
+		}
+
+		if s != nil {
+			if len(env.Payload) > 0 {
+				e.recordFirstResponse(s)
+			}
+			s.ProcessRx(&env)
 		}
 	}
+
+	atomic.AddUint64(&e.metrics.downloads, 1)
+	atomic.AddUint64(&e.metrics.downloadBytes, uint64(payloadBytes))
+	atomic.AddUint64(&e.metrics.downloadLatencyMs, downloadLatencyMs)
+	atomicMaxUint64(&e.metrics.maxDownloadLatencyMs, downloadLatencyMs)
+	if fileAgeMs > 0 {
+		atomic.AddUint64(&e.metrics.fileAgeMs, fileAgeMs)
+		atomicMaxUint64(&e.metrics.maxFileAgeMs, fileAgeMs)
+	}
+	e.deleteAsync(ctx, fname)
 }
 
 func (e *Engine) RemoveSession(id string) {
@@ -672,6 +765,60 @@ func (e *Engine) recordFirstResponse(s *Session) {
 	atomicMaxUint64(&e.metrics.maxFirstResponseMs, latencyMs)
 	if latencyMs > 2000 {
 		log.Printf("session first response slow: id=%s target=%s first_response_ms=%d", s.ID, targetAddr, latencyMs)
+	}
+}
+
+func (e *Engine) recordFirstUpload(sessionID string) {
+	e.sessionMu.RLock()
+	s := e.sessions[sessionID]
+	e.sessionMu.RUnlock()
+	if s == nil {
+		return
+	}
+
+	s.mu.Lock()
+	if s.firstUploadLogged {
+		s.mu.Unlock()
+		return
+	}
+	s.firstUploadLogged = true
+	start := s.createdAt
+	if !s.firstTxQueuedAt.IsZero() {
+		start = s.firstTxQueuedAt
+	}
+	targetAddr := s.TargetAddr
+	elapsed := time.Since(start)
+	s.mu.Unlock()
+
+	latencyMs := uint64(elapsed.Milliseconds())
+	atomic.AddUint64(&e.metrics.firstUploads, 1)
+	atomic.AddUint64(&e.metrics.firstUploadMs, latencyMs)
+	atomicMaxUint64(&e.metrics.maxFirstUploadMs, latencyMs)
+	if latencyMs > 1000 {
+		log.Printf("session first upload slow: id=%s target=%s first_upload_ms=%d", sessionID, targetAddr, latencyMs)
+	}
+}
+
+func (e *Engine) recordFirstServerSeen(s *Session, fileAgeMs uint64) {
+	if fileAgeMs == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	if s.serverSeenLogged {
+		s.mu.Unlock()
+		return
+	}
+	s.serverSeenLogged = true
+	targetAddr := s.TargetAddr
+	sessionID := s.ID
+	s.mu.Unlock()
+
+	atomic.AddUint64(&e.metrics.firstServerSeens, 1)
+	atomic.AddUint64(&e.metrics.firstServerSeenMs, fileAgeMs)
+	atomicMaxUint64(&e.metrics.maxFirstServerSeenMs, fileAgeMs)
+	if fileAgeMs > 2000 {
+		log.Printf("session first server seen slow: id=%s target=%s first_server_seen_ms=%d", sessionID, targetAddr, fileAgeMs)
 	}
 }
 
@@ -734,7 +881,12 @@ func (e *Engine) cleanupLoop(ctx context.Context) {
 					ts, err := strconv.ParseInt(tsStr, 10, 64)
 					if err == nil {
 						t := time.Unix(0, ts)
-						if time.Since(t) > e.cleanupFileMaxAge {
+						age := time.Since(t)
+						if e.shouldDropStaleFile(age) {
+							atomic.AddUint64(&e.metrics.pollFilesStale, 1)
+							if age > 0 {
+								atomicMaxUint64(&e.metrics.maxFileAgeMs, uint64(age.Milliseconds()))
+							}
 							e.deleteAsync(ctx, f)
 						}
 					}
@@ -764,7 +916,7 @@ func (e *Engine) metricsLoop(ctx context.Context) {
 			e.sessionMu.RUnlock()
 
 			log.Printf(
-				"metrics: active=%d uploads=%d/%s up_avg_ms=%.0f downloads=%d/%s down_avg_ms=%.0f lists=%d list_avg_ms=%.0f deletes=%d file_age_avg_ms=%.0f first_resp_avg_ms=%.0f errors[u=%d d=%d l=%d del=%d]",
+				"metrics: active=%d uploads=%d/%s up_avg_ms=%.0f downloads=%d/%s down_avg_ms=%.0f lists=%d list_avg_ms=%.0f poll_files[f=%d p=%d stale=%d max_batch=%d] deletes=%d file_age_avg_ms=%.0f max_file_age_ms=%d first_upload_avg_ms=%.0f first_seen_avg_ms=%.0f first_resp_avg_ms=%.0f errors[u=%d d=%d l=%d del=%d]",
 				activeSessions,
 				current.uploads-last.uploads,
 				formatBytes(current.uploadBytes-last.uploadBytes),
@@ -774,8 +926,15 @@ func (e *Engine) metricsLoop(ctx context.Context) {
 				averageMs(current.downloadLatencyMs-last.downloadLatencyMs, current.downloads-last.downloads),
 				current.listCalls-last.listCalls,
 				averageMs(current.listLatencyMs-last.listLatencyMs, current.listCalls-last.listCalls),
+				current.pollFilesFound-last.pollFilesFound,
+				current.pollFilesProcessed-last.pollFilesProcessed,
+				current.pollFilesStale-last.pollFilesStale,
+				current.maxPollBatchFiles,
 				current.deletes-last.deletes,
 				averageMs(current.fileAgeMs-last.fileAgeMs, current.downloads-last.downloads),
+				current.maxFileAgeMs,
+				averageMs(current.firstUploadMs-last.firstUploadMs, current.firstUploads-last.firstUploads),
+				averageMs(current.firstServerSeenMs-last.firstServerSeenMs, current.firstServerSeens-last.firstServerSeens),
 				averageMs(current.firstResponseMs-last.firstResponseMs, current.firstResponses-last.firstResponses),
 				current.uploadErrors-last.uploadErrors,
 				current.downloadErrors-last.downloadErrors,
@@ -809,9 +968,19 @@ func (e *Engine) snapshotMetrics() engineMetrics {
 		maxDeleteLatencyMs:   atomic.LoadUint64(&e.metrics.maxDeleteLatencyMs),
 		fileAgeMs:            atomic.LoadUint64(&e.metrics.fileAgeMs),
 		maxFileAgeMs:         atomic.LoadUint64(&e.metrics.maxFileAgeMs),
+		pollFilesFound:       atomic.LoadUint64(&e.metrics.pollFilesFound),
+		pollFilesProcessed:   atomic.LoadUint64(&e.metrics.pollFilesProcessed),
+		pollFilesStale:       atomic.LoadUint64(&e.metrics.pollFilesStale),
+		maxPollBatchFiles:    atomic.LoadUint64(&e.metrics.maxPollBatchFiles),
 		firstResponses:       atomic.LoadUint64(&e.metrics.firstResponses),
 		firstResponseMs:      atomic.LoadUint64(&e.metrics.firstResponseMs),
 		maxFirstResponseMs:   atomic.LoadUint64(&e.metrics.maxFirstResponseMs),
+		firstUploads:         atomic.LoadUint64(&e.metrics.firstUploads),
+		firstUploadMs:        atomic.LoadUint64(&e.metrics.firstUploadMs),
+		maxFirstUploadMs:     atomic.LoadUint64(&e.metrics.maxFirstUploadMs),
+		firstServerSeens:     atomic.LoadUint64(&e.metrics.firstServerSeens),
+		firstServerSeenMs:    atomic.LoadUint64(&e.metrics.firstServerSeenMs),
+		maxFirstServerSeenMs: atomic.LoadUint64(&e.metrics.maxFirstServerSeenMs),
 	}
 }
 
@@ -821,6 +990,30 @@ func muxPayloadBytes(mux []Envelope) int {
 		total += len(env.Payload)
 	}
 	return total
+}
+
+func firstUploadCandidates(mux []Envelope) []string {
+	sessionIDs := make([]string, 0, len(mux))
+	seen := make(map[string]bool, len(mux))
+	for _, env := range mux {
+		if env.Seq != 0 || seen[env.SessionID] {
+			continue
+		}
+		seen[env.SessionID] = true
+		sessionIDs = append(sessionIDs, env.SessionID)
+	}
+	return sessionIDs
+}
+
+func (e *Engine) effectivePollInterval(base time.Duration, activeSessions int) time.Duration {
+	interval := base
+	if interval <= 0 {
+		interval = e.pollTicker
+	}
+	if e.coldStartActive() && e.coldStartPoll > 0 && e.coldStartPoll < interval {
+		interval = e.coldStartPoll
+	}
+	return interval
 }
 
 func formatBytes(n uint64) string {
@@ -857,18 +1050,37 @@ func atomicMaxUint64(target *uint64, value uint64) {
 	}
 }
 
-func fileAgeMilliseconds(filename string) uint64 {
+func (e *Engine) shouldDropStaleFile(age time.Duration) bool {
+	if age <= 0 {
+		return false
+	}
+	if e.startupStaleMaxAge > 0 && age > e.startupStaleMaxAge {
+		return true
+	}
+	return e.cleanupFileMaxAge > 0 && age > e.cleanupFileMaxAge
+}
+
+func fileAgeDuration(filename string) time.Duration {
 	parts := strings.Split(filename, "-")
 	if len(parts) < 3 {
 		return 0
 	}
 	tsStr := strings.TrimSuffix(parts[len(parts)-1], ".bin")
+	tsStr = strings.TrimSuffix(tsStr, ".json")
 	ts, err := strconv.ParseInt(tsStr, 10, 64)
 	if err != nil || ts <= 0 {
 		return 0
 	}
 	age := time.Since(time.Unix(0, ts))
 	if age < 0 {
+		return 0
+	}
+	return age
+}
+
+func fileAgeMilliseconds(filename string) uint64 {
+	age := fileAgeDuration(filename)
+	if age <= 0 {
 		return 0
 	}
 	return uint64(age.Milliseconds())

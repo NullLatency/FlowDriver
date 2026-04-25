@@ -100,10 +100,12 @@ func main() {
 	engine.SetIdlePollStep(appCfg.IdlePollStepMs)
 	engine.SetSessionIdleTimeout(appCfg.SessionIdleTimeoutSec)
 	engine.SetCleanupFileMaxAge(appCfg.CleanupFileMaxAgeSec)
+	engine.SetStartupStaleMaxAge(appCfg.StartupStaleMaxAgeSec)
 	engine.SetMaxPayloadBytes(appCfg.MaxPayloadBytes)
 	engine.SetBackpressureBytes(appCfg.BackpressureBytes)
 	engine.SetStorageOpTimeout(appCfg.StorageOpTimeoutSec)
 	engine.SetImmediateFlush(appCfg.ImmediateFlush)
+	engine.SetColdStartBurst(appCfg.ColdStartBurstMs, appCfg.ColdStartPollMs)
 	engine.SetMetricsLogInterval(appCfg.MetricsLogSec)
 	engine.Start(ctx)
 	health.Start(ctx, appCfg.HealthListenAddr, engine)
@@ -140,6 +142,8 @@ func main() {
 
 			// Instantly ping a blank payload so the remote end opens the actual TCP destination
 			session.EnqueueTx(nil)
+			engine.TriggerWarmPoll()
+			engine.ForceFlush()
 
 			return transport.NewVirtualConn(session, engine), nil
 		}),

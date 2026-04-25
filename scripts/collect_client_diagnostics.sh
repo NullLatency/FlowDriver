@@ -48,24 +48,35 @@ run_capture() {
   } > "${OUT_DIR}/${name}" 2>&1
 }
 
+run_raw_capture() {
+  local name="$1"
+  shift
+  echo "Collecting ${name}..."
+  "$@" > "${OUT_DIR}/${name}" 2>&1 || true
+}
+
 run_server_ssh_capture() {
   local name="$1"
   local remote_cmd="$2"
   local out="${OUT_DIR}/${name}"
   local ssh_opts=(-o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=1)
   local ssh_proxy_opts=(-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -o "ProxyCommand=nc -x ${SSH_PROXY_HOSTPORT} -X 5 %h %p")
+  local timeout_cmd=()
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_cmd=(timeout 30)
+  fi
 
   {
     echo "Collecting ${name}..."
     echo "\$ ssh ${SERVER_SSH} ${remote_cmd}"
     echo "--- direct ssh attempt ---"
-    if ssh "${ssh_opts[@]}" "$SERVER_SSH" "$remote_cmd"; then
+    if "${timeout_cmd[@]}" ssh "${ssh_opts[@]}" "$SERVER_SSH" "$remote_cmd"; then
       exit 0
     fi
 
     echo "--- direct ssh failed; trying through SOCKS5 proxy ${SSH_PROXY_HOSTPORT} ---"
     echo "\$ ssh -o ProxyCommand='nc -x ${SSH_PROXY_HOSTPORT} -X 5 %h %p' ${SERVER_SSH} ${remote_cmd}"
-    ssh "${ssh_proxy_opts[@]}" "$SERVER_SSH" "$remote_cmd" || true
+    "${timeout_cmd[@]}" ssh "${ssh_proxy_opts[@]}" "$SERVER_SSH" "$remote_cmd" || true
   } > "$out" 2>&1
 }
 
@@ -95,7 +106,7 @@ run_capture go_version.txt go version
 run_capture process.txt ps aux
 run_capture ports.txt lsof -nP -iTCP:1080 -iTCP:18081 -sTCP:LISTEN
 run_capture health.txt curl -sS --max-time 5 "$CLIENT_HEALTH_URL"
-run_capture metrics_initial.json curl -sS --max-time 5 "$CLIENT_METRICS_URL"
+run_raw_capture metrics_initial.json curl -sS --max-time 5 "$CLIENT_METRICS_URL"
 
 if [ -f "$CLIENT_LOG" ]; then
   echo "Collecting client_tail_initial.log..."
@@ -121,8 +132,10 @@ while [ "$SECONDS" -lt "$END" ]; do
     METRICS="null"
   fi
   printf '{"ts":"%s","metrics":%s}\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$METRICS" >> "${OUT_DIR}/client_metrics_samples.jsonl"
+  printf '.'
   sleep "$SAMPLE_INTERVAL"
 done
+printf '\n'
 
 if [ "$RUN_CURLS" = "1" ]; then
   echo "Running curl benchmarks; each one can take up to ${CURL_MAX_TIME}s..."
@@ -133,7 +146,7 @@ else
   echo "Skipping curl benchmarks. Set FLOWDRIVER_RUN_CURLS=1 to enable them."
 fi
 
-run_capture metrics_final.json curl -sS --max-time 5 "$CLIENT_METRICS_URL"
+run_raw_capture metrics_final.json curl -sS --max-time 5 "$CLIENT_METRICS_URL"
 
 if [ -f "$CLIENT_LOG" ]; then
   echo "Collecting client_tail.log..."
@@ -144,5 +157,5 @@ fi
 
 if [ -n "$SERVER_SSH" ]; then
   run_server_ssh_capture server_metrics.txt 'curl -sS --max-time 5 http://127.0.0.1:18080/metrics'
-  run_server_ssh_capture server_tail.log 'tail -n 1200 ~/flowdriver/server.log 2>/dev/null || true'
+  run_server_ssh_capture server_tail.log 'journalctl -u flowdriver-server -n 1200 --no-pager 2>/dev/null || tail -n 1200 ~/flowdriver/server.log 2>/dev/null || true'
 fi

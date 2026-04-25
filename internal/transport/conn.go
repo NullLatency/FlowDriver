@@ -64,8 +64,13 @@ func (v *VirtualConn) Read(b []byte) (n int, err error) {
 
 func (v *VirtualConn) Write(b []byte) (n int, err error) {
 	if len(b) > 0 {
-		v.session.EnqueueTx(b)
-		v.engine.RequestFlush()
+		firstPacket := v.session.EnqueueTx(b)
+		if firstPacket {
+			v.engine.TriggerWarmPoll()
+			v.engine.ForceFlush()
+		} else {
+			v.engine.RequestFlush()
+		}
 	}
 	return len(b), nil
 }
@@ -75,7 +80,7 @@ func (v *VirtualConn) Close() error {
 	v.session.closed = true
 	v.session.txCond.Broadcast() // Wake up any writers blocked on backpressure
 	v.session.mu.Unlock()
-	v.engine.RequestFlush()
+	v.engine.ForceFlush()
 
 	// A closed connection no longer accepts writes efficiently
 	// Next periodic engine flush will securely remove context

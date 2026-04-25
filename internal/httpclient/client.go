@@ -44,7 +44,7 @@ func (t *hostRewriteTransport) RoundTrip(req *http.Request) (*http.Response, err
 // and manipulate TLS/HTTP headers as specified in the config.
 func NewCustomClient(cfg TransportConfig) *http.Client {
 	dialer := &net.Dialer{
-		Timeout:   15 * time.Second,
+		Timeout:   8 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 
@@ -63,9 +63,9 @@ func NewCustomClient(cfg TransportConfig) *http.Client {
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   20,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   15 * time.Second,
+		TLSHandshakeTimeout:   8 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
@@ -79,6 +79,6 @@ func NewCustomClient(cfg TransportConfig) *http.Client {
 
 	return &http.Client{
 		Transport: rt,
-		Timeout:   45 * time.Second,
+		Timeout:   15 * time.Second,
 	}
 }

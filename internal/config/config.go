@@ -50,6 +50,10 @@ type AppConfig struct {
 	// CleanupFileMaxAgeSec deletes stale transport files after this many seconds.
 	CleanupFileMaxAgeSec int `json:"cleanup_file_max_age_sec,omitempty"`
 
+	// StartupStaleMaxAgeSec ignores and deletes transport files older than this many seconds.
+	// It prevents leftovers from a previous run from polluting cold-start measurements.
+	StartupStaleMaxAgeSec int `json:"startup_stale_max_age_sec,omitempty"`
+
 	// StorageRetryMax is the maximum number of retry attempts for transient storage errors.
 	StorageRetryMax int `json:"storage_retry_max,omitempty"`
 
@@ -74,6 +78,12 @@ type AppConfig struct {
 	// ImmediateFlush uploads new data promptly instead of waiting for the next flush tick.
 	// Keep this disabled for browser workloads; Google Drive performs better with batching.
 	ImmediateFlush bool `json:"immediate_flush,omitempty"`
+
+	// ColdStartBurstMs keeps polling temporarily fast when a new session starts.
+	ColdStartBurstMs int `json:"cold_start_burst_ms,omitempty"`
+
+	// ColdStartPollMs is the temporary polling interval used during the cold-start burst.
+	ColdStartPollMs int `json:"cold_start_poll_ms,omitempty"`
 
 	// MetricsLogSec logs throughput and storage operation counters every N seconds.
 	MetricsLogSec int `json:"metrics_log_sec,omitempty"`
@@ -102,6 +112,7 @@ func (c *AppConfig) ApplyProfile() {
 		setDefault(&c.IdlePollStepMs, 200)
 		setDefault(&c.SessionIdleTimeoutSec, 60)
 		setDefault(&c.CleanupFileMaxAgeSec, 45)
+		setDefault(&c.StartupStaleMaxAgeSec, 20)
 		setDefault(&c.StorageRetryMax, 4)
 		setDefault(&c.StorageRetryBaseMs, 200)
 		setDefault(&c.StorageOpTimeoutSec, 45)
@@ -109,6 +120,8 @@ func (c *AppConfig) ApplyProfile() {
 		setDefault(&c.MaxActiveSessions, 24)
 		setDefault(&c.SessionWaitTimeoutSec, 12)
 		setDefault(&c.BackpressureBytes, 4*1024*1024)
+		setDefault(&c.ColdStartBurstMs, 15000)
+		setDefault(&c.ColdStartPollMs, 75)
 		setDefault(&c.MetricsLogSec, 30)
 	case "quota-saver":
 		setDefault(&c.RefreshRateMs, 750)
@@ -117,6 +130,7 @@ func (c *AppConfig) ApplyProfile() {
 		setDefault(&c.IdlePollStepMs, 750)
 		setDefault(&c.SessionIdleTimeoutSec, 45)
 		setDefault(&c.CleanupFileMaxAgeSec, 30)
+		setDefault(&c.StartupStaleMaxAgeSec, 20)
 		setDefault(&c.StorageRetryMax, 3)
 		setDefault(&c.StorageRetryBaseMs, 500)
 		setDefault(&c.StorageOpTimeoutSec, 45)
@@ -124,6 +138,8 @@ func (c *AppConfig) ApplyProfile() {
 		setDefault(&c.MaxActiveSessions, 16)
 		setDefault(&c.SessionWaitTimeoutSec, 10)
 		setDefault(&c.BackpressureBytes, 4*1024*1024)
+		setDefault(&c.ColdStartBurstMs, 5000)
+		setDefault(&c.ColdStartPollMs, 250)
 		setDefault(&c.MetricsLogSec, 60)
 	default:
 		setDefault(&c.RefreshRateMs, 200)
@@ -132,6 +148,7 @@ func (c *AppConfig) ApplyProfile() {
 		setDefault(&c.IdlePollStepMs, 500)
 		setDefault(&c.SessionIdleTimeoutSec, 60)
 		setDefault(&c.CleanupFileMaxAgeSec, 30)
+		setDefault(&c.StartupStaleMaxAgeSec, 20)
 		setDefault(&c.StorageRetryMax, 3)
 		setDefault(&c.StorageRetryBaseMs, 300)
 		setDefault(&c.StorageOpTimeoutSec, 45)
@@ -139,6 +156,8 @@ func (c *AppConfig) ApplyProfile() {
 		setDefault(&c.MaxActiveSessions, 24)
 		setDefault(&c.SessionWaitTimeoutSec, 12)
 		setDefault(&c.BackpressureBytes, 4*1024*1024)
+		setDefault(&c.ColdStartBurstMs, 10000)
+		setDefault(&c.ColdStartPollMs, 100)
 		setDefault(&c.MetricsLogSec, 30)
 	}
 }

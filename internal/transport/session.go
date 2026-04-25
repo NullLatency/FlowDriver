@@ -22,8 +22,11 @@ type Session struct {
 	rxSeq               uint64
 	rxQueue             map[uint64]*Envelope
 	createdAt           time.Time
+	firstTxQueuedAt     time.Time
 	lastActivity        time.Time
 	firstResponseLogged bool
+	firstUploadLogged   bool
+	serverSeenLogged    bool
 	closed              bool
 	rxClosed            bool // Safely tracks if RxChan was successfully closed
 	TargetAddr          string
@@ -58,7 +61,7 @@ func (s *Session) SetBackpressureBytes(bytes int) {
 	s.mu.Unlock()
 }
 
-func (s *Session) EnqueueTx(data []byte) {
+func (s *Session) EnqueueTx(data []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -68,8 +71,13 @@ func (s *Session) EnqueueTx(data []byte) {
 		s.txCond.Wait()
 	}
 
+	firstPacket := s.txSeq == 0 && len(s.txBuf) == 0
+	if firstPacket && s.firstTxQueuedAt.IsZero() {
+		s.firstTxQueuedAt = time.Now()
+	}
 	s.txBuf = append(s.txBuf, data...)
 	s.lastActivity = time.Now()
+	return firstPacket
 }
 
 func (s *Session) ClearTx() {
