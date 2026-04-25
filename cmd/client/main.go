@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/NullLatency/flow-driver/internal/config"
 	"github.com/NullLatency/flow-driver/internal/httpclient"
@@ -94,12 +95,20 @@ func main() {
 		cid = generateSessionID()[:8] // Short random ID as fallback
 	}
 	engine := transport.NewEngine(backend, true, cid)
+
 	if appCfg.RefreshRateMs > 0 {
 		engine.SetPollRate(appCfg.RefreshRateMs)
 	}
 	if appCfg.FlushRateMs > 0 {
 		engine.SetFlushRate(appCfg.FlushRateMs)
 	}
+	if appCfg.IdleTimeoutSec > 0 {
+		engine.SetIdleTimeout(time.Duration(appCfg.IdleTimeoutSec) * time.Second)
+	}
+	if appCfg.StaleFileTTLSec > 0 {
+		engine.SetStaleFileTTL(time.Duration(appCfg.StaleFileTTLSec) * time.Second)
+	}
+
 	engine.Start(ctx)
 
 	listenAddr := appCfg.ListenAddr
