@@ -1,5 +1,8 @@
 {
   "storage_type": "google",
-  "refresh_rate_ms": 100,
-  "flush_rate_ms": 300
+  "google_folder_id": "YOUR_FOLDER_ID",
+  "refresh_rate_ms": 150,
+  "flush_rate_ms": 250,
+  "idle_timeout_sec": 60,
+  "stale_file_ttl_sec": 300
 }
