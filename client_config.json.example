@@ -1,12 +1,14 @@
 {
   "listen_addr": "127.0.0.1:1080",
   "storage_type": "google",
-  "refresh_rate_ms": 200,
-  "flush_rate_ms": 300,
+  "google_folder_id": "YOUR_FOLDER_ID",
+  "refresh_rate_ms": 150,
+  "flush_rate_ms": 250,
+  "idle_timeout_sec": 60,
+  "stale_file_ttl_sec": 300,
   "transport": {
     "TargetIP": "216.239.38.120:443",
     "SNI": "google.com",
-    "HostHeader": "www.googleapis.com",
-    "InsecureSkipVerify": false
+    "HostHeader": "www.googleapis.com"
   }
 }
