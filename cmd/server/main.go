@@ -10,9 +10,9 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/NullLatency/flow-driver/internal/app"
 	"github.com/NullLatency/flow-driver/internal/config"
-	"github.com/NullLatency/flow-driver/internal/httpclient"
-	"github.com/NullLatency/flow-driver/internal/storage"
+	"github.com/NullLatency/flow-driver/internal/health"
 	"github.com/NullLatency/flow-driver/internal/transport"
 )
 
@@ -30,23 +30,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+	appCfg.ApplyProfile()
 
-	var backend storage.Backend
-	if appCfg.StorageType == "google" {
-		customHttpClient := httpclient.NewCustomClient(appCfg.Transport)
-		backend = storage.NewGoogleBackend(customHttpClient, gcPath, appCfg.GoogleFolderID)
-	} else {
-		backend, err = storage.NewLocalBackend(appCfg.LocalDir)
-		if err != nil {
-			log.Fatalf("Failed to init local storage: %v", err)
-		}
+	backend, err := app.BuildBackend(appCfg, gcPath)
+	if err != nil {
+		log.Fatalf("Failed to init storage: %v", err)
 	}
 	if err := backend.Login(ctx); err != nil {
 		log.Fatalf("Backend login failed: %v", err)
 	}
 
 	// AUTOMATION: If folder ID is missing, find or create it
-	if appCfg.StorageType == "google" && appCfg.GoogleFolderID == "" {
+	if appCfg.StorageType == "google" && len(appCfg.GoogleLanes) == 0 && appCfg.GoogleFolderID == "" {
 		log.Println("Zero-Config: Searching for existing Google Drive folder 'Flow-Data'...")
 		folderID, err := backend.FindFolder(ctx, "Flow-Data")
 		if err != nil {
@@ -78,6 +73,15 @@ func main() {
 	if appCfg.FlushRateMs > 0 {
 		engine.SetFlushRate(appCfg.FlushRateMs)
 	}
+	engine.SetIdlePollMax(appCfg.IdlePollMaxMs)
+	engine.SetIdlePollStep(appCfg.IdlePollStepMs)
+	engine.SetSessionIdleTimeout(appCfg.SessionIdleTimeoutSec)
+	engine.SetCleanupFileMaxAge(appCfg.CleanupFileMaxAgeSec)
+	engine.SetMaxPayloadBytes(appCfg.MaxPayloadBytes)
+	engine.SetBackpressureBytes(appCfg.BackpressureBytes)
+	engine.SetStorageOpTimeout(appCfg.StorageOpTimeoutSec)
+	engine.SetImmediateFlush(appCfg.ImmediateFlush)
+	engine.SetMetricsLogInterval(appCfg.MetricsLogSec)
 
 	// Called by polling loop when a new incoming session file is found
 	engine.OnNewSession = func(sessionID, targetAddr string, session *transport.Session) {
@@ -86,6 +90,7 @@ func main() {
 	}
 
 	engine.Start(ctx)
+	health.Start(ctx, appCfg.HealthListenAddr, engine)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -114,6 +119,7 @@ func handleServerConn(sessionID, targetAddr string, session *transport.Session, 
 			n, err := conn.Read(buf)
 			if n > 0 {
 				session.EnqueueTx(buf[:n])
+				engine.RequestFlush()
 			}
 			if err != nil {
 				errCh <- err

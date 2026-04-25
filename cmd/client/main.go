@@ -12,10 +12,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/NullLatency/flow-driver/internal/app"
 	"github.com/NullLatency/flow-driver/internal/config"
-	"github.com/NullLatency/flow-driver/internal/httpclient"
-	"github.com/NullLatency/flow-driver/internal/storage"
+	"github.com/NullLatency/flow-driver/internal/health"
 	"github.com/NullLatency/flow-driver/internal/transport"
 	"github.com/things-go/go-socks5"
 	"github.com/things-go/go-socks5/statute"
@@ -48,23 +49,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+	appCfg.ApplyProfile()
 
-	var backend storage.Backend
-	if appCfg.StorageType == "google" {
-		customHttpClient := httpclient.NewCustomClient(appCfg.Transport)
-		backend = storage.NewGoogleBackend(customHttpClient, gcPath, appCfg.GoogleFolderID)
-	} else {
-		backend, err = storage.NewLocalBackend(appCfg.LocalDir)
-		if err != nil {
-			log.Fatalf("Failed to init local storage: %v", err)
-		}
+	backend, err := app.BuildBackend(appCfg, gcPath)
+	if err != nil {
+		log.Fatalf("Failed to init storage: %v", err)
 	}
 	if err := backend.Login(ctx); err != nil {
 		log.Fatalf("Backend login failed: %v", err)
 	}
 
 	// AUTOMATION: If folder ID is missing, find or create it
-	if appCfg.StorageType == "google" && appCfg.GoogleFolderID == "" {
+	if appCfg.StorageType == "google" && len(appCfg.GoogleLanes) == 0 && appCfg.GoogleFolderID == "" {
 		log.Println("Zero-Config: Searching for existing Google Drive folder 'Flow-Data'...")
 		folderID, err := backend.FindFolder(ctx, "Flow-Data")
 		if err != nil {
@@ -100,7 +96,17 @@ func main() {
 	if appCfg.FlushRateMs > 0 {
 		engine.SetFlushRate(appCfg.FlushRateMs)
 	}
+	engine.SetIdlePollMax(appCfg.IdlePollMaxMs)
+	engine.SetIdlePollStep(appCfg.IdlePollStepMs)
+	engine.SetSessionIdleTimeout(appCfg.SessionIdleTimeoutSec)
+	engine.SetCleanupFileMaxAge(appCfg.CleanupFileMaxAgeSec)
+	engine.SetMaxPayloadBytes(appCfg.MaxPayloadBytes)
+	engine.SetBackpressureBytes(appCfg.BackpressureBytes)
+	engine.SetStorageOpTimeout(appCfg.StorageOpTimeoutSec)
+	engine.SetImmediateFlush(appCfg.ImmediateFlush)
+	engine.SetMetricsLogInterval(appCfg.MetricsLogSec)
 	engine.Start(ctx)
+	health.Start(ctx, appCfg.HealthListenAddr, engine)
 
 	listenAddr := appCfg.ListenAddr
 	if listenAddr == "" {
@@ -110,6 +116,10 @@ func main() {
 	// Create the library SOCKS5 server wrapping our custom Google Drive Engine tunnel
 	server := socks5.NewServer(
 		socks5.WithDial(func(dc context.Context, network, addr string) (net.Conn, error) {
+			if err := waitForSessionCapacity(dc, engine, appCfg.MaxActiveSessions, appCfg.SessionWaitTimeoutSec); err != nil {
+				return nil, err
+			}
+
 			sessionID := generateSessionID()
 
 			// Intelligently parse the address string to warn users if their browser is natively leaking DNS
@@ -157,4 +167,35 @@ func main() {
 	<-sigCh
 	log.Println("Shutting down client...")
 	cancel()
+}
+
+func waitForSessionCapacity(ctx context.Context, engine *transport.Engine, maxActive, timeoutSec int) error {
+	if maxActive <= 0 {
+		return nil
+	}
+	if engine.ActiveSessionCount() < maxActive {
+		return nil
+	}
+
+	waitTimeout := 10 * time.Second
+	if timeoutSec > 0 {
+		waitTimeout = time.Duration(timeoutSec) * time.Second
+	}
+	timer := time.NewTimer(waitTimeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("too many active sessions: %d/%d", engine.ActiveSessionCount(), maxActive)
+		case <-ticker.C:
+			if engine.ActiveSessionCount() < maxActive {
+				return nil
+			}
+		}
+	}
 }

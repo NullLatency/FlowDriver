@@ -100,10 +100,67 @@ Create your `config.json` based on the provided examples:
 {
   "storage_type": "google",
   "google_folder_id": "YOUR_FOLDER_ID",
-  "refresh_rate_ms": 100,
-  "flush_rate_ms": 300
+  "performance_profile": "balanced",
+  "refresh_rate_ms": 200,
+  "flush_rate_ms": 300,
+  "idle_poll_max_ms": 2000,
+  "idle_poll_step_ms": 500,
+  "session_idle_timeout_sec": 25,
+  "cleanup_file_max_age_sec": 60,
+  "storage_retry_max": 3,
+  "storage_retry_base_ms": 300,
+  "storage_op_timeout_sec": 45,
+  "max_payload_bytes": 786432,
+  "max_active_sessions": 0,
+  "session_wait_timeout_sec": 15,
+  "backpressure_bytes": 4194304,
+  "immediate_flush": false,
+  "metrics_log_sec": 30,
+  "health_listen_addr": "127.0.0.1:18080",
+  "google_lanes": []
 }
 ```
+
+### Runtime Tuning / تنظیمات اجرا
+
+`performance_profile` can be set to:
+- `fast`: lower startup latency, higher Google API usage.
+- `balanced`: recommended default for normal browsing and downloads.
+- `quota-saver`: lower API usage, higher startup latency.
+
+You can override any profile value directly:
+- `refresh_rate_ms`: how often each side polls for incoming files while active.
+- `flush_rate_ms`: how often buffered data is uploaded.
+- `idle_poll_max_ms`: server-side maximum polling delay while idle. Lower values reduce first-load delay.
+- `session_idle_timeout_sec`: inactive connection timeout.
+- `storage_retry_max` and `storage_retry_base_ms`: retry policy for transient Google API failures.
+- `storage_op_timeout_sec`: fail-fast timeout for individual Google Drive operations.
+- `max_payload_bytes`: maximum per-session payload size written into one transport file.
+- `max_active_sessions`: client-side cap for concurrent SOCKS sessions.
+- `session_wait_timeout_sec`: how long new SOCKS sessions wait for capacity.
+- `backpressure_bytes`: per-session buffer limit before application writes wait.
+- `immediate_flush`: uploads new data promptly instead of waiting for the next flush tick. Leave this off for browser/video/download workloads because Google Drive performs better with batched files.
+- `metrics_log_sec`: periodic operational metrics log interval.
+- `health_listen_addr`: optional local HTTP endpoint for `/healthz` and `/metrics`.
+
+For higher throughput or resilience, configure multiple Google Drive lanes on both client and server:
+
+```json
+{
+  "google_lanes": [
+    {
+      "credentials_path": "credentials.json",
+      "google_folder_id": "LANE_1_FOLDER_ID"
+    },
+    {
+      "credentials_path": "credentials-lane2.json",
+      "google_folder_id": "LANE_2_FOLDER_ID"
+    }
+  ]
+}
+```
+
+Each lane can use a separate Google account or folder. Uploads are distributed across healthy lanes, and a lane with transient failures is temporarily avoided.
 
 ### 3. Run / اجرا
 
@@ -115,6 +172,30 @@ Create your `config.json` based on the provided examples:
 **Client:**
 ```bash
 ./bin/client -c client_config.json -gc credentials.json
+```
+
+### Run Server as a systemd Service / اجرای سرور به صورت سرویس
+
+On an Ubuntu VPS, copy `scripts/flowdriver-server.service` to systemd after placing the server files in `/home/ubuntu/flowdriver`:
+
+```bash
+sudo cp scripts/flowdriver-server.service /etc/systemd/system/flowdriver-server.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now flowdriver-server
+sudo systemctl status flowdriver-server
+```
+
+Logs:
+
+```bash
+journalctl -u flowdriver-server -f
+```
+
+Health and metrics:
+
+```bash
+curl http://127.0.0.1:18080/healthz
+curl http://127.0.0.1:18080/metrics
 ```
 
 ---
