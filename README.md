@@ -1,3 +1,5 @@
+# All credits go to https://github.com/NullLatency/FlowDriver
+**This repo only creates releases for various architectures. Arm64 version for using the client inside android via Termux.**
 # Flow Driver 🌊
 
 **Flow Driver** is a covert transport system designed to tunnel network traffic (SOCKS5) through common cloud storage platforms like Google Drive. It allows for reliable communication in restrictive environments by leveraging legitimate API traffic.
