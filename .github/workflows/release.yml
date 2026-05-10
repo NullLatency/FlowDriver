@@ -74,13 +74,7 @@ jobs:
             goarch: arm64
             ext: ""
             name: android-arm64
-
-          - goos: android
-            goarch: arm
-            goarm: 7
-            ext: ""
-            name: android-armv7
-
+            
     steps:
 
       - name: Checkout
