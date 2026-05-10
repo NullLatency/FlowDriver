@@ -1,0 +1,39 @@
+name: Build FlowDriver
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+
+  build-android-arm64:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build Android ARM64 Client
+        run: |
+          mkdir -p release
+
+          CGO_ENABLED=0 \
+          GOOS=android \
+          GOARCH=arm64 \
+          go build \
+          -ldflags="-s -w" \
+          -o release/client-android-arm64 \
+          ./cmd/client
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowdriver-android-arm64
+          path: release/client-android-arm64
