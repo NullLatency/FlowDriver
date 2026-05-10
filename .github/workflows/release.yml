@@ -1,70 +1,211 @@
-name: Release
+name: Release Builds
 
 on:
+
   push:
     tags:
       - 'v*'
+
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build and Release
+
+  build:
+
     runs-on: ubuntu-latest
+
     strategy:
+      fail-fast: false
+
       matrix:
+
         include:
-          - os: linux
-            arch: amd64
-            goos: linux
+
+          - goos: linux
             goarch: amd64
-          - os: windows
-            arch: amd64
-            goos: windows
-            goarch: amd64
-          - os: macOS-amd64
-            arch: amd64
-            goos: darwin
-            goarch: amd64
-          - os: macOS-arm64
-            arch: arm64
-            goos: darwin
+            ext: ""
+            name: linux-amd64
+
+          - goos: linux
             goarch: arm64
+            ext: ""
+            name: linux-arm64
+
+          - goos: linux
+            goarch: arm
+            goarm: 7
+            ext: ""
+            name: linux-armv7
+
+          - goos: linux
+            goarch: 386
+            ext: ""
+            name: linux-386
+
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+            name: windows-amd64
+
+          - goos: windows
+            goarch: arm64
+            ext: ".exe"
+            name: windows-arm64
+
+          - goos: windows
+            goarch: 386
+            ext: ".exe"
+            name: windows-386
+
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+            name: macos-amd64
+
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            name: macos-arm64
+
+          - goos: android
+            goarch: arm64
+            ext: ""
+            name: android-arm64
+
+          - goos: android
+            goarch: arm
+            goarm: 7
+            ext: ""
+            name: android-armv7
 
     steps:
-      - name: Checkout code
+
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.24'
 
-      - name: Build Binaries
-        shell: bash
+      - name: Prepare
         run: |
-          VERSION=${GITHUB_REF_NAME}
-          FOLDER_NAME="flow-driver-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
-          mkdir -p $FOLDER_NAME
-          
-          SUFFIX=""
-          if [ "${{ matrix.goos }}" == "windows" ]; then
-            SUFFIX=".exe"
-          fi
-          
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o $FOLDER_NAME/client$SUFFIX ./cmd/client
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o $FOLDER_NAME/server$SUFFIX ./cmd/server
-          
-          cp client_config.json.example $FOLDER_NAME/
-          cp server_config.json.example $FOLDER_NAME/
-          cp README.md $FOLDER_NAME/
-          
-          zip -r "${FOLDER_NAME}.zip" $FOLDER_NAME
+          mkdir -p release
 
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: flow-driver-*.zip
+      - name: Build Client
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+
+        run: |
+
+          CLIENT_NAME="flowdriver-client-${{ matrix.name }}${{ matrix.ext }}"
+
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o "release/${CLIENT_NAME}" \
+            ./cmd/client
+
+      - name: Build Server
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+
+        run: |
+
+          SERVER_NAME="flowdriver-server-${{ matrix.name }}${{ matrix.ext }}"
+
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o "release/${SERVER_NAME}" \
+            ./cmd/server
+
+      - name: Copy Example Configs
+        run: |
+
+          cp client_config.json.example \
+            release/client_config.json.example || true
+
+          cp server_config.json.example \
+            release/server_config.json.example || true
+
+      - name: Package Release
+        run: |
+
+          cd release
+
+          for file in flowdriver-*; do
+
+            if [[ -f "$file" ]]; then
+
+              ARCHIVE="${file}.tar.gz"
+
+              tar -czf "$ARCHIVE" \
+                "$file" \
+                client_config.json.example \
+                server_config.json.example || true
+            fi
+          done
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: release/*.tar.gz
+
+  publish:
+
+    needs: build
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare Release Files
+        run: |
+
+          mkdir final
+
+          find artifacts -type f -name "*.tar.gz" \
+            -exec cp {} final/ \;
+
+      - name: Generate Tag
+        id: tag
+
+        run: |
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="manual-$(date +%Y%m%d-%H%M%S)"
+          fi
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+
+          generate_release_notes: true
+
+          files: |
+            final/*.tar.gz
