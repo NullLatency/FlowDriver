@@ -9,10 +9,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/NullLatency/flow-driver/internal/app"
 	"github.com/NullLatency/flow-driver/internal/config"
-	"github.com/NullLatency/flow-driver/internal/httpclient"
-	"github.com/NullLatency/flow-driver/internal/storage"
+	"github.com/NullLatency/flow-driver/internal/health"
 	"github.com/NullLatency/flow-driver/internal/transport"
 )
 
@@ -30,23 +31,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+	appCfg.ApplyProfile()
 
-	var backend storage.Backend
-	if appCfg.StorageType == "google" {
-		customHttpClient := httpclient.NewCustomClient(appCfg.Transport)
-		backend = storage.NewGoogleBackend(customHttpClient, gcPath, appCfg.GoogleFolderID)
-	} else {
-		backend, err = storage.NewLocalBackend(appCfg.LocalDir)
-		if err != nil {
-			log.Fatalf("Failed to init local storage: %v", err)
-		}
+	backend, err := app.BuildBackend(appCfg, gcPath)
+	if err != nil {
+		log.Fatalf("Failed to init storage: %v", err)
 	}
 	if err := backend.Login(ctx); err != nil {
 		log.Fatalf("Backend login failed: %v", err)
 	}
 
 	// AUTOMATION: If folder ID is missing, find or create it
-	if appCfg.StorageType == "google" && appCfg.GoogleFolderID == "" {
+	if appCfg.StorageType == "google" && len(appCfg.GoogleLanes) == 0 && appCfg.GoogleFolderID == "" {
 		log.Println("Zero-Config: Searching for existing Google Drive folder 'Flow-Data'...")
 		folderID, err := backend.FindFolder(ctx, "Flow-Data")
 		if err != nil {
@@ -78,6 +74,18 @@ func main() {
 	if appCfg.FlushRateMs > 0 {
 		engine.SetFlushRate(appCfg.FlushRateMs)
 	}
+	engine.SetIdlePollMax(appCfg.IdlePollMaxMs)
+	engine.SetIdlePollStep(appCfg.IdlePollStepMs)
+	engine.SetSessionIdleTimeout(appCfg.SessionIdleTimeoutSec)
+	engine.SetCleanupFileMaxAge(appCfg.CleanupFileMaxAgeSec)
+	engine.SetStartupStaleMaxAge(appCfg.StartupStaleMaxAgeSec)
+	engine.SetMaxPayloadBytes(appCfg.MaxPayloadBytes)
+	engine.SetBackpressureBytes(appCfg.BackpressureBytes)
+	engine.SetStorageOpTimeout(appCfg.StorageOpTimeoutSec)
+	engine.SetImmediateFlush(appCfg.ImmediateFlush)
+	engine.SetColdStartBurst(appCfg.ColdStartBurstMs, appCfg.ColdStartPollMs)
+	engine.SetMetricsLogInterval(appCfg.MetricsLogSec)
+	engine.SetTargetMetricsTopN(appCfg.TargetMetricsTopN)
 
 	// Called by polling loop when a new incoming session file is found
 	engine.OnNewSession = func(sessionID, targetAddr string, session *transport.Session) {
@@ -86,6 +94,7 @@ func main() {
 	}
 
 	engine.Start(ctx)
+	health.Start(ctx, appCfg.HealthListenAddr, engine)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -97,7 +106,11 @@ func main() {
 func handleServerConn(sessionID, targetAddr string, session *transport.Session, engine *transport.Engine) {
 	defer engine.RemoveSession(sessionID)
 
-	conn, err := net.Dial("tcp", targetAddr)
+	dialer := net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	conn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
 		log.Printf("Dial error to %s: %v", targetAddr, err)
 		// Send back a close packet? Just closing the session will notify client
@@ -109,11 +122,17 @@ func handleServerConn(sessionID, targetAddr string, session *transport.Session, 
 
 	// Conn -> Tx (Res)
 	go func() {
-		buf := make([]byte, 4096)
+		buf := make([]byte, 32*1024)
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
-				session.EnqueueTx(buf[:n])
+				firstPacket := session.EnqueueTx(buf[:n])
+				if firstPacket {
+					engine.TriggerWarmPoll()
+					engine.ForceFlush()
+				} else {
+					engine.RequestFlush()
+				}
 			}
 			if err != nil {
 				errCh <- err

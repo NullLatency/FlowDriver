@@ -1,0 +1,16 @@
+[Unit]
+Description=Flow Driver server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/flowdriver
+ExecStart=/home/ubuntu/flowdriver/server -c /home/ubuntu/flowdriver/server_config.json -gc /home/ubuntu/flowdriver/credentials.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

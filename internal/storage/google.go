@@ -51,15 +51,30 @@ type GoogleBackend struct {
 	// map from filename to Google Drive file ID
 	fileIDs   map[string]string
 	fileIdsMu sync.RWMutex
+
+	retryMax    int
+	retryBaseMs int
 }
 
 // NewGoogleBackend creates a new GoogleBackend.
 func NewGoogleBackend(client *http.Client, saPath, folderID string) *GoogleBackend {
 	return &GoogleBackend{
-		httpClient: client,
-		saPath:     saPath,
-		folderID:   folderID,
-		fileIDs:    make(map[string]string),
+		httpClient:  client,
+		saPath:      saPath,
+		folderID:    folderID,
+		fileIDs:     make(map[string]string),
+		retryMax:    3,
+		retryBaseMs: 300,
+	}
+}
+
+// SetRetryPolicy configures retries for transient Google API failures.
+func (b *GoogleBackend) SetRetryPolicy(maxAttempts, baseDelayMs int) {
+	if maxAttempts > 0 {
+		b.retryMax = maxAttempts
+	}
+	if baseDelayMs > 0 {
+		b.retryBaseMs = baseDelayMs
 	}
 }
 
@@ -171,13 +186,15 @@ func (b *GoogleBackend) refreshAccessToken(ctx context.Context) error {
 }
 
 func (b *GoogleBackend) executeTokenRequest(ctx context.Context, v url.Values) error {
-	req, err := http.NewRequestWithContext(ctx, "POST", b.tokenURI, strings.NewReader(v.Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := b.httpClient.Do(req)
+	body := v.Encode()
+	resp, err := b.doRetry(ctx, "token", func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", b.tokenURI, strings.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return b.httpClient.Do(req)
+	})
 	if err != nil {
 		return fmt.Errorf("token request failed: %w", err)
 	}
@@ -223,40 +240,51 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 		return err
 	}
 
-	pr, pw := io.Pipe()
-	metaWriter := multipart.NewWriter(pw)
+	payload, err := io.ReadAll(data)
+	if err != nil {
+		return err
+	}
+	resp, err := b.doRetry(ctx, "upload", func() (*http.Response, error) {
+		var body bytes.Buffer
+		metaWriter := multipart.NewWriter(&body)
 
-	go func() {
-		defer pw.Close()
-		defer metaWriter.Close()
-
-		// Part 1: Metadata
 		h := make(textproto.MIMEHeader)
 		h.Set("Content-Type", "application/json; charset=UTF-8")
-		part1, _ := metaWriter.CreatePart(h)
+		part1, err := metaWriter.CreatePart(h)
+		if err != nil {
+			return nil, err
+		}
 		meta := map[string]interface{}{
 			"name": filename,
 		}
 		if b.folderID != "" {
 			meta["parents"] = []string{b.folderID}
 		}
-		json.NewEncoder(part1).Encode(meta)
+		if err := json.NewEncoder(part1).Encode(meta); err != nil {
+			return nil, err
+		}
 
-		// Part 2: Content
 		h = make(textproto.MIMEHeader)
 		h.Set("Content-Type", "application/octet-stream")
-		part2, _ := metaWriter.CreatePart(h)
-		io.Copy(part2, data)
-	}()
+		part2, err := metaWriter.CreatePart(h)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := part2.Write(payload); err != nil {
+			return nil, err
+		}
+		if err := metaWriter.Close(); err != nil {
+			return nil, err
+		}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", pr)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("Content-Type", metaWriter.FormDataContentType())
-
-	resp, err := b.httpClient.Do(req)
+		req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", bytes.NewReader(body.Bytes()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", metaWriter.FormDataContentType())
+		return b.httpClient.Do(req)
+	})
 	if err != nil {
 		return err
 	}
@@ -275,59 +303,75 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 		return nil, err
 	}
 
-	q := fmt.Sprintf("name contains '%s'", prefix)
+	q := fmt.Sprintf("name contains '%s' and trashed = false", escapeDriveQuery(prefix))
 	if b.folderID != "" {
 		q += fmt.Sprintf(" and '%s' in parents", b.folderID)
 	}
 
-	u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
-	v := u.Query()
-	v.Set("q", q)
-	v.Set("fields", "files(id, name)")
-	u.RawQuery = v.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("list returned %d: %s", resp.StatusCode, string(body))
-	}
-
-	var resData struct {
-		Files []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"files"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
-		return nil, err
-	}
-
-	b.fileIdsMu.Lock()
-	// SAFETY: Prevent fileIDs map from infinite growth
-	if len(b.fileIDs) > 2000 {
-		b.fileIDs = make(map[string]string)
-	}
-
 	var names []string
-	for _, f := range resData.Files {
-		// Only collect exact prefix matches client-side just in case
-		if strings.HasPrefix(f.Name, prefix) {
-			b.fileIDs[f.Name] = f.ID
-			names = append(names, f.Name)
+	pageToken := ""
+	for {
+		u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
+		v := u.Query()
+		v.Set("q", q)
+		v.Set("fields", "nextPageToken, files(id, name)")
+		v.Set("pageSize", "1000")
+		v.Set("spaces", "drive")
+		if pageToken != "" {
+			v.Set("pageToken", pageToken)
 		}
+		u.RawQuery = v.Encode()
+
+		resp, err := b.doRetry(ctx, "list", func() (*http.Response, error) {
+			req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Authorization", "Bearer "+tok)
+			return b.httpClient.Do(req)
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, fmt.Errorf("list returned %d: %s", resp.StatusCode, string(body))
+		}
+
+		var resData struct {
+			NextPageToken string `json:"nextPageToken"`
+			Files         []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"files"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		resp.Body.Close()
+
+		b.fileIdsMu.Lock()
+		// SAFETY: Prevent fileIDs map from infinite growth
+		if len(b.fileIDs) > 5000 {
+			b.fileIDs = make(map[string]string)
+		}
+		for _, f := range resData.Files {
+			// Only collect exact prefix matches client-side just in case
+			if strings.HasPrefix(f.Name, prefix) {
+				b.fileIDs[f.Name] = f.ID
+				names = append(names, f.Name)
+			}
+		}
+		b.fileIdsMu.Unlock()
+
+		if resData.NextPageToken == "" {
+			break
+		}
+		pageToken = resData.NextPageToken
 	}
-	b.fileIdsMu.Unlock()
 
 	return names, nil
 }
@@ -346,13 +390,14 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/drive/v3/files/"+fileID+"?alt=media", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.doRetry(ctx, "download", func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/drive/v3/files/"+fileID+"?alt=media", nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		return b.httpClient.Do(req)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -380,13 +425,14 @@ func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "DELETE", "https://www.googleapis.com/drive/v3/files/"+fileID, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.doRetry(ctx, "delete", func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "DELETE", "https://www.googleapis.com/drive/v3/files/"+fileID, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		return b.httpClient.Do(req)
+	})
 	if err != nil {
 		return err
 	}
@@ -416,14 +462,15 @@ func (b *GoogleBackend) CreateFolder(ctx context.Context, name string) (string, 
 	}
 	body, _ := json.Marshal(meta)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/drive/v3/files", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.doRetry(ctx, "create folder", func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", "https://www.googleapis.com/drive/v3/files", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		return b.httpClient.Do(req)
+	})
 	if err != nil {
 		return "", err
 	}
@@ -458,13 +505,14 @@ func (b *GoogleBackend) FindFolder(ctx context.Context, name string) (string, er
 	v.Set("fields", "files(id, name)")
 	u.RawQuery = v.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-
-	resp, err := b.httpClient.Do(req)
+	resp, err := b.doRetry(ctx, "find folder", func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		return b.httpClient.Do(req)
+	})
 	if err != nil {
 		return "", err
 	}
@@ -490,4 +538,53 @@ func (b *GoogleBackend) FindFolder(ctx context.Context, name string) (string, er
 		return resData.Files[0].ID, nil
 	}
 	return "", nil
+}
+
+func (b *GoogleBackend) doRetry(ctx context.Context, operation string, fn func() (*http.Response, error)) (*http.Response, error) {
+	attempts := b.retryMax
+	if attempts <= 0 {
+		attempts = 1
+	}
+	baseDelay := time.Duration(b.retryBaseMs) * time.Millisecond
+	if baseDelay <= 0 {
+		baseDelay = 300 * time.Millisecond
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		resp, err := fn()
+		if err == nil && resp != nil && !shouldRetryStatus(resp.StatusCode) {
+			return resp, nil
+		}
+
+		if resp != nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			if err == nil {
+				lastErr = fmt.Errorf("%s returned %d: %s", operation, resp.StatusCode, strings.TrimSpace(string(body)))
+			}
+		}
+		if err != nil {
+			lastErr = err
+		}
+		if attempt == attempts {
+			break
+		}
+
+		delay := baseDelay << (attempt - 1)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return nil, lastErr
+}
+
+func shouldRetryStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500
+}
+
+func escapeDriveQuery(value string) string {
+	return strings.ReplaceAll(value, "'", "\\'")
 }

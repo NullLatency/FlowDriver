@@ -41,6 +41,7 @@ for platform in "${platforms[@]}"; do
     # Copy Example Configs and README
     cp client_config.json.example "$OUTPUT_PATH/"
     cp server_config.json.example "$OUTPUT_PATH/"
+    cp scripts/flowdriver-server.service "$OUTPUT_PATH/"
     cp README.md "$OUTPUT_PATH/"
     
     # Zip it up

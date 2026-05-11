@@ -1,12 +1,34 @@
 {
   "listen_addr": "127.0.0.1:1080",
   "storage_type": "google",
+  "performance_profile": "balanced",
   "refresh_rate_ms": 200,
   "flush_rate_ms": 300,
+  "idle_poll_max_ms": 2000,
+  "idle_poll_step_ms": 500,
+  "session_idle_timeout_sec": 25,
+  "cleanup_file_max_age_sec": 60,
+  "startup_stale_max_age_sec": 20,
+  "storage_retry_max": 3,
+  "storage_retry_base_ms": 300,
+  "storage_op_timeout_sec": 45,
+  "max_payload_bytes": 786432,
+  "max_active_sessions": 0,
+  "target_metrics_top_n": 10,
+  "blocked_targets": [],
+  "low_priority_targets": [],
+  "session_wait_timeout_sec": 15,
+  "backpressure_bytes": 4194304,
+  "immediate_flush": false,
+  "cold_start_burst_ms": 10000,
+  "cold_start_poll_ms": 100,
+  "metrics_log_sec": 30,
+  "health_listen_addr": "127.0.0.1:18081",
   "transport": {
     "TargetIP": "216.239.38.120:443",
     "SNI": "google.com",
     "HostHeader": "www.googleapis.com",
     "InsecureSkipVerify": false
-  }
+  },
+  "google_lanes": []
 }
