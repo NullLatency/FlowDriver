@@ -15,21 +15,43 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: linux
-            arch: amd64
+          # Linux
+          - os: linux-amd64
             goos: linux
             goarch: amd64
-          - os: windows
-            arch: amd64
+          - os: linux-arm64
+            goos: linux
+            goarch: arm64
+          - os: linux-armv7
+            goos: linux
+            goarch: arm
+            goarm: 7
+          - os: linux-386
+            goos: linux
+            goarch: 386
+          
+          # Windows
+          - os: windows-amd64
             goos: windows
             goarch: amd64
-          - os: macOS-amd64
-            arch: amd64
+          - os: windows-arm64
+            goos: windows
+            goarch: arm64
+          - os: windows-386
+            goos: windows
+            goarch: 386
+          
+          # macOS
+          - os: macos-amd64
             goos: darwin
             goarch: amd64
-          - os: macOS-arm64
-            arch: arm64
+          - os: macos-arm64
             goos: darwin
+            goarch: arm64
+          
+          # Android
+          - os: android-arm64
+            goos: android
             goarch: arm64
 
     steps:
@@ -45,26 +67,39 @@ jobs:
         shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME}
-          FOLDER_NAME="flow-driver-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
-          mkdir -p $FOLDER_NAME
+          
+          CLIENT_FOLDER="flowdriver-client-${VERSION}-${{ matrix.os }}"
+          SERVER_FOLDER="flowdriver-server-${VERSION}-${{ matrix.os }}"
+          
+          mkdir -p $CLIENT_FOLDER
+          mkdir -p $SERVER_FOLDER
           
           SUFFIX=""
           if [ "${{ matrix.goos }}" == "windows" ]; then
             SUFFIX=".exe"
           fi
           
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o $FOLDER_NAME/client$SUFFIX ./cmd/client
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o $FOLDER_NAME/server$SUFFIX ./cmd/server
+          # Build Client
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} go build -o $CLIENT_FOLDER/client$SUFFIX ./cmd/client
           
-          cp client_config.json.example $FOLDER_NAME/
-          cp server_config.json.example $FOLDER_NAME/
-          cp README.md $FOLDER_NAME/
+          # Build Server
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} go build -o $SERVER_FOLDER/server$SUFFIX ./cmd/server
           
-          zip -r "${FOLDER_NAME}.zip" $FOLDER_NAME
+          # Copy and rename config files
+          cp client_config.json.example $CLIENT_FOLDER/client_config.json
+          cp server_config.json.example $SERVER_FOLDER/server_config.json
+          
+          # Copy README
+          cp README.md $CLIENT_FOLDER/
+          cp README.md $SERVER_FOLDER/
+          
+          # Zip the folders
+          zip -r "${CLIENT_FOLDER}.zip" $CLIENT_FOLDER
+          zip -r "${SERVER_FOLDER}.zip" $SERVER_FOLDER
 
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
-          files: flow-driver-*.zip
+          files: flowdriver-*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
